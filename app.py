@@ -28,14 +28,19 @@ jobs            = {}
 # OPENAI CALL  (replaces ollama)
 # ─────────────────────────────────────────────────────
 def call_llm(prompt, api_key):
+    import logging
     client = OpenAI(api_key=api_key)
-    response = client.chat.completions.create(
-        model=MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.2,
-        max_tokens=600,
-    )
-    return response.choices[0].message.content.strip()
+    try:
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+            max_tokens=600,
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        logging.error(f"OpenAI API error: {e}")
+        raise
 
 # ─────────────────────────────────────────────────────
 # URL UTILITIES
@@ -306,10 +311,11 @@ Current description: {description}
 
 Return ONLY JSON: {{"score": <1-5>, "description": "<final description>"}}"""
 
-def summarize(url, content, api_key):
+def summarize(url, content, api_key, progress_q=None):
     snippet = content[:3500].strip()
     if not snippet:
         return None
+    last_error = None
     for attempt in range(3):
         try:
             raw    = call_llm(SUMMARIZE_PROMPT.format(url=url, content=snippet), api_key)
@@ -320,9 +326,13 @@ def summarize(url, content, api_key):
             result = json.loads(raw.strip())
             if "title" in result and "description" in result:
                 return result
-        except:
+        except Exception as e:
+            last_error = str(e)
             if attempt < 2:
                 time.sleep(0.5)
+            else:
+                if progress_q:
+                    progress_q.put({"type": "stage", "msg": f"API error: {last_error[:120]}", "pct": 0})
     return None
 
 def rescore_and_fix(url, content, description, api_key):
@@ -1069,7 +1079,7 @@ def start():
             summaries    = []
             failed_pages = []
             for i, page in enumerate(pages, 1):
-                result = summarize(page["url"], page["content"], api_key)
+                result = summarize(page["url"], page["content"], api_key, q)
                 ok     = result is not None
                 if ok:
                     summaries.append({
@@ -1085,7 +1095,7 @@ def start():
             if failed_pages:
                 q.put({"type": "stage", "msg": f"Retrying {len(failed_pages)} failed pages", "pct": 80})
                 for page in failed_pages:
-                    result = summarize(page["url"], page["content"], api_key)
+                    result = summarize(page["url"], page["content"], api_key, q)
                     if result:
                         summaries.append({
                             "url"        : page["url"],
