@@ -197,7 +197,60 @@ def detect_product(url, product_map):
 # ─────────────────────────────────────────────────────
 # PAGE FETCHING
 # ─────────────────────────────────────────────────────
+def extract_meta(html):
+    """
+    Extract meta title, meta description, H1, H2s from raw HTML.
+    These are the cleanest signals on any page — no sidebar noise.
+    """
+    def clean(s):
+        s = re.sub(r"<[^>]+>", " ", s)
+        s = re.sub(r"&amp;", "&", s)
+        s = re.sub(r"&quot;", '"', s)
+        s = re.sub(r"&#39;", "'", s)
+        s = re.sub(r"&[a-z]+;", " ", s)
+        return re.sub(r"\s+", " ", s).strip()
+
+    # Meta title — strip site suffix
+    m = re.search(r"<title[^>]*>(.*?)</title>", html, re.IGNORECASE | re.DOTALL)
+    meta_title = clean(m.group(1)) if m else ""
+    meta_title = re.split(r"\s*[|\u2013\u2014]\s*", meta_title)[0].strip()
+
+    # Meta description
+    m = re.search(r'<meta[^>]+name=["\']description["\'][^>]+content=["\'](.*?)["\']', html, re.IGNORECASE | re.DOTALL)
+    if not m:
+        m = re.search(r'<meta[^>]+content=["\'](.*?)["\'"][^>]+name=["\']description["\']', html, re.IGNORECASE | re.DOTALL)
+    meta_desc = clean(m.group(1)) if m else ""
+
+    # OG description fallback
+    if not meta_desc:
+        m = re.search(r'<meta[^>]+property=["\']og:description["\'][^>]+content=["\'](.*?)["\']', html, re.IGNORECASE | re.DOTALL)
+        if not m:
+            m = re.search(r'<meta[^>]+content=["\'](.*?)["\'"][^>]+property=["\']og:description["\']', html, re.IGNORECASE | re.DOTALL)
+        meta_desc = clean(m.group(1)) if m else ""
+
+    # OG title fallback
+    if not meta_title:
+        m = re.search(r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\'](.*?)["\']', html, re.IGNORECASE | re.DOTALL)
+        meta_title = clean(m.group(1)) if m else ""
+
+    # H1
+    m = re.search(r"<h1[^>]*>(.*?)</h1>", html, re.IGNORECASE | re.DOTALL)
+    h1 = clean(m.group(1)) if m else ""
+
+    # H2s — up to 6
+    h2s = re.findall(r"<h2[^>]*>(.*?)</h2>", html, re.IGNORECASE | re.DOTALL)
+    h2s = [clean(h) for h in h2s if len(clean(h)) > 3][:6]
+
+    return {
+        "meta_title": meta_title[:200],
+        "meta_desc" : meta_desc[:400],
+        "h1"        : h1[:150],
+        "h2s"       : " | ".join(h2s)[:300] if h2s else "",
+    }
+
+
 def extract_main_content(html):
+    """Extract main content area, ignoring nav/sidebar/footer."""
     for tag in ["main", "article"]:
         pat = re.compile(r"<" + tag + r"[^>]*>(.*?)</" + tag + r">", re.DOTALL | re.IGNORECASE)
         m = pat.search(html)
@@ -223,36 +276,56 @@ def extract_main_content(html):
 
     return html
 
+
 def fetch_page(url):
     try:
         r = requests.get(url, headers=HEADERS, timeout=10)
         if r.status_code != 200:
             return None
-        html = r.text
+        raw_html = r.text
 
+        # Extract meta signals from raw HTML BEFORE any stripping
+        meta = extract_meta(raw_html)
+
+        # Strip noise tags
+        html = raw_html
         for tag in ["script", "style", "nav", "footer", "header", "aside", "noscript", "iframe", "svg", "form"]:
             html = re.sub(r"<" + tag + r"[^>]*>.*?</" + tag + r">", " ", html, flags=re.DOTALL | re.IGNORECASE)
 
-        noise_ids_classes = [
-            "sidebar", "widget", "banner", "promo", "advertisement",
-            "breadcrumb", "pagination", "related", "social", "share",
-            "cookie", "popup", "modal", "overlay", "newsletter",
-            "contact-bar", "sticky", "floating", "phone-bar",
-        ]
-        for noise in noise_ids_classes:
+        # Strip noise sections by class/id
+        for noise in ["sidebar", "widget", "banner", "promo", "advertisement",
+                      "breadcrumb", "pagination", "related", "social", "share",
+                      "cookie", "popup", "modal", "overlay", "newsletter",
+                      "contact-bar", "sticky", "floating", "phone-bar"]:
             pat = re.compile(
                 r'<(?:div|section|ul|span)[^>]+(?:class|id)="[^"]*' + noise + r'[^"]*"[^>]*>.*?</(?:div|section|ul|span)>',
                 re.DOTALL | re.IGNORECASE
             )
             html = pat.sub(" ", html)
 
+        # Extract main content body
         main_html = extract_main_content(html)
-        text = re.sub(r"<[^>]+>", " ", main_html)
-        text = re.sub(r"\+\d[\d\s\-(). ]{7,20}", " ", text)
-        text = re.sub(r"\b[A-Fa-f0-9]{40,}\b", " ", text)
-        text = re.sub(r"\s+", " ", text).strip()
+        body = re.sub(r"<[^>]+>", " ", main_html)
+        body = re.sub(r"\+\d[\d\s\-(). ]{7,20}", " ", body)  # phone numbers
+        body = re.sub(r"[A-Fa-f0-9]{40,}", " ", body)              # SHA hashes
+        body = re.sub(r"\s+", " ", body).strip()
 
-        return text[:4000] if len(text) > 100 else None
+        # Build structured context — meta signals first, body last
+        parts = []
+        if meta["meta_title"]:
+            parts.append(f"META TITLE: {meta['meta_title']}")
+        if meta["meta_desc"]:
+            parts.append(f"META DESCRIPTION: {meta['meta_desc']}")
+        if meta["h1"] and meta["h1"].lower() != meta["meta_title"].lower():
+            parts.append(f"H1: {meta['h1']}")
+        if meta["h2s"]:
+            parts.append(f"H2s: {meta['h2s']}")
+        if body:
+            parts.append(f"CONTENT: {body[:2000]}")
+
+        structured = "\n".join(parts)
+        return structured if len(structured) > 100 else None
+
     except:
         return None
 
