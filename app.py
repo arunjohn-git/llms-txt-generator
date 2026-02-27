@@ -259,57 +259,82 @@ def fetch_page(url):
 # ─────────────────────────────────────────────────────
 # SUMMARIZATION
 # ─────────────────────────────────────────────────────
-SUMMARIZE_PROMPT = """You are a technical writer creating entries for an llms.txt file.
+SUMMARIZE_PROMPT = """You are a technical writer creating llms.txt entries. These entries are read by AI crawlers to understand what a page contains and who it is for — so precision and distinctiveness matter far more than marketing language.
 
-Read the page content carefully and return ONLY a JSON object with two fields.
+Read the page content carefully and return ONLY a JSON object.
 
-STEP 1 — Classify the page type:
+STEP 1 — Classify page type:
 feature-list, pricing, download, support, demo, release-notes, documentation, blog, faq, about, legal, other
 
-STEP 2 — Write title and description using type-specific rules:
+STEP 2 — Infer primary audience from the language and content of the page:
+it-admin, end-user, developer, executive, general
+Do NOT guess from the URL. Read the actual content.
 
-- feature-list:   Name the 3-4 most important capability areas. Do NOT list individual features.
-- pricing:        State what editions/tiers exist and the pricing model (annual, per-user, etc.).
-- download:       State what is downloaded, trial duration, key system requirements.
-- support:        State what support channels are available (form, email, phone, chat, knowledge base).
-- demo:           State what the demo covers and how to request or access it.
-- release-notes:  State what type of updates are documented and the time range covered.
-- documentation:  State what the docs cover and who they help.
-- faq:            State the main topic areas the FAQ addresses — not the feature list.
-- blog/about/other: Describe what the page actually covers in 2-3 sentences.
+STEP 3 — Write title and description.
 
-UNIVERSAL RULES (all types):
-- Title: 5-8 words, no dates, no version numbers, no site name unless essential
-- Description: max 3 sentences, each adding new information
-- Start with the subject — never start with "This page", "The page", "Users to", "A guide", "A list", "Covers"
-- No comma-separated lists of more than 3 items
-- No navigation links, sidebar content, phone numbers, or footer content
-- Active voice, present tense
+TITLE (5-8 words):
+- Reflect the specific purpose of THIS page
+- No dates, version numbers, build numbers
+- Must be distinct from any generic product name
 
-Return ONLY this JSON — no markdown, no explanation:
+DESCRIPTION rules by page type:
+- feature-list:   Name the 3-4 most important capability areas. No bullet dumps.
+- pricing:        State editions/tiers, pricing model, and what differentiates them.
+- download:       State what is downloaded, trial length, platform requirements.
+- support:        State exactly what support channels exist on this page.
+- demo:           State what the demo shows and how to access it.
+- release-notes:  State what kinds of updates are covered and the time range.
+- documentation:  State the specific topic covered and who benefits.
+- faq:            State the main topic areas addressed — not a feature list.
+- blog/about/other: Describe what is unique about this specific page.
+
+UNIVERSAL DESCRIPTION RULES:
+- FIRST SENTENCE must contain the single most distinctive, specific fact about this page.
+  Ask yourself: what would make an AI crawler choose THIS page over 10 similar ones?
+  Lead with that. It could be: a specific audience, a unique capability, a named tool, a version range, a concrete outcome.
+- Weave the audience in naturally: "IT administrators can...", "End users who need to...", "Developers integrating..."
+- Maximum 3 sentences. Every sentence must add new information — no repetition.
+- No comma-separated lists of more than 3 items.
+- No filler openers: never start with "This page", "The page", "A guide", "A list", "Users to", "Covers"
+- No nav links, sidebar content, phone numbers, or footer content.
+- Active voice, present tense.
+
+JSON FORMAT:
+- Double quotes only, no apostrophes in values
+- No trailing commas, no line breaks inside values
+- Return raw JSON only — no markdown, no explanation
+
+Return exactly:
 {{"title": "...", "description": "..."}}
 
 URL: {url}
 Page content:
 {content}"""
 
-RESCORE_PROMPT = """Rate this llms.txt description on specificity from 1 to 5:
-1 = Generic filler or comma-list of features
-2 = Vague but not filler
-3 = Adequate
-4 = Good and specific
-5 = Excellent
+RESCORE_PROMPT = """You are evaluating an llms.txt description. These are read by AI crawlers — the goal is precision and distinctiveness, not marketing copy.
 
-If score <= 2, rewrite the description following these rules:
+Score the description from 1 to 5:
+1 = Generic filler, comma-list dump, or starts with "This page / The page / A guide"
+2 = Vague — could describe any page in this category
+3 = Adequate — accurate but lacks the most distinctive fact
+4 = Good — specific, accurate, audience-aware
+5 = Excellent — leads with the most distinctive fact, audience clear, zero padding
+
+IF score <= 2: rewrite following these rules:
+- First sentence must lead with the single most distinctive, specific fact about this URL
+- Weave audience in naturally ("IT administrators can...", "End users who need to...")
 - Max 3 sentences, no comma lists of more than 3 items
 - No filler openers, no nav/sidebar content
 - Active voice, present tense
 
+IF score >= 3: return description unchanged.
+
 URL: {url}
-Content (first 1500 chars): {content}
+Page content (first 1500 chars): {content}
 Current description: {description}
 
-Return ONLY JSON: {{"score": <1-5>, "description": "<final description>"}}"""
+Return ONLY JSON: {{"score": <1-5>, "description": "<final description>"}}
+No markdown, no explanation."""
 
 def summarize(url, content, api_key, progress_q=None):
     snippet = content[:3500].strip()
@@ -409,6 +434,85 @@ def score_description(desc):
 
     return score, issues
 
+DIFFERENTIATE_PROMPT = """Two pages on the same website have descriptions that are too similar.
+An AI crawler cannot tell them apart. Rewrite the description for Page B so it focuses ONLY
+on what is unique to Page B — what Page A does NOT cover.
+
+Do not mention Page A. Just make Page B description distinctive on its own.
+Max 3 sentences. Lead with the most distinctive fact about Page B.
+Active voice, present tense. No filler openers.
+
+Page A URL: {url_a}
+Page A description: {desc_a}
+
+Page B URL: {url_b}
+Page B content: {content_b}
+Page B current description: {desc_b}
+
+Return ONLY JSON: {{"description": "<rewritten description for Page B>"}}
+No markdown, no explanation."""
+
+def description_similarity(a, b):
+    """Word overlap ratio — site-agnostic. Returns 0.0 to 1.0."""
+    words_a = set(re.findall(r'\b\w{4,}\b', a.lower()))
+    words_b = set(re.findall(r'\b\w{4,}\b', b.lower()))
+    if not words_a or not words_b:
+        return 0.0
+    overlap = len(words_a & words_b)
+    return overlap / min(len(words_a), len(words_b))
+
+def fix_sibling_duplicates(summaries, page_map, api_key, progress_q=None):
+    """
+    Phase 3 — Sibling dedup:
+    Find pairs on the same domain with >70% description similarity.
+    Re-summarize the second with explicit differentiation instruction.
+    Zero hardcoding — works for any site.
+    """
+    if progress_q:
+        progress_q.put({"type": "stage", "msg": "QA Phase 3 — Sibling differentiation", "pct": 94})
+
+    domain_groups = defaultdict(list)
+    for item in summaries:
+        domain = urlparse(item["url"]).netloc
+        domain_groups[domain].append(item)
+
+    fixed = 0
+    for domain, items in domain_groups.items():
+        if len(items) < 2:
+            continue
+        for i in range(len(items)):
+            for j in range(i + 1, len(items)):
+                a = items[i]
+                b = items[j]
+                sim = description_similarity(a["description"], b["description"])
+                if sim >= 0.70:
+                    content_b = page_map.get(b["url"], "")
+                    if not content_b:
+                        continue
+                    try:
+                        raw = call_llm(DIFFERENTIATE_PROMPT.format(
+                            url_a=a["url"], desc_a=a["description"],
+                            url_b=b["url"], content_b=content_b[:2000],
+                            desc_b=b["description"]
+                        ), api_key)
+                        if raw.startswith("```"):
+                            raw = raw.split("```")[1]
+                            if raw.startswith("json"):
+                                raw = raw[4:]
+                        result  = json.loads(raw.strip())
+                        new_desc = result.get("description", "").strip()
+                        if new_desc and len(new_desc) > 60:
+                            b["description"] = new_desc
+                            fixed += 1
+                    except:
+                        pass
+
+    if progress_q:
+        progress_q.put({"type": "qa_result", "fixed": fixed, "dups": 0})
+
+    return summaries
+
+
 def fix_quality(summaries, page_map, api_key, progress_q=None):
     total = len(summaries)
 
@@ -457,6 +561,9 @@ def fix_quality(summaries, page_map, api_key, progress_q=None):
 
     if progress_q:
         progress_q.put({"type": "qa_result", "fixed": rescore_fixed, "dups": 0})
+
+    # ── Phase 3: Sibling deduplication ──
+    summaries = fix_sibling_duplicates(summaries, page_map, api_key, progress_q)
 
     return summaries
 
