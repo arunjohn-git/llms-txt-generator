@@ -393,14 +393,14 @@ Score the description from 1 to 5:
 4 = Good — specific, accurate, audience-aware
 5 = Excellent — leads with the most distinctive fact, audience clear, zero padding
 
-IF score <= 2: rewrite following these rules:
+IF score <= 3: rewrite following these rules:
 - First sentence must lead with the single most distinctive, specific fact about this URL
 - Weave audience in naturally ("IT administrators can...", "End users who need to...")
 - Max 3 sentences, no comma lists of more than 3 items
 - No filler openers, no nav/sidebar content
 - Active voice, present tense
 
-IF score >= 3: return description unchanged.
+IF score >= 4: return description unchanged.
 
 URL: {url}
 Page content (first 1500 chars): {content}
@@ -622,7 +622,7 @@ def fix_quality(summaries, page_map, api_key, progress_q=None):
     rescore_fixed = 0
     for i, item in enumerate(summaries):
         score, issues = score_description(item["description"])
-        if score <= 2:
+        if score <= 3:
             content = page_map.get(item["url"], "")
             if content:
                 new_score, new_desc = rescore_and_fix(item["url"], content, item["description"], api_key)
