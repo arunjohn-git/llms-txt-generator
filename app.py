@@ -464,6 +464,7 @@ def fix_quality(summaries, page_map, api_key, progress_q=None):
 # GENERATE llms.txt
 # ─────────────────────────────────────────────────────
 def generate_llms_txt(summaries, product_map):
+    # Deduplicate by URL
     seen_urls = set()
     deduped   = []
     for item in summaries:
@@ -471,38 +472,13 @@ def generate_llms_txt(summaries, product_map):
             seen_urls.add(item["url"])
             deduped.append(item)
 
-    grouped       = defaultdict(list)
-    product_order = []
-    for item in deduped:
-        p = item.get("product", "Other")
-        if p not in grouped:
-            product_order.append(p)
-        grouped[p].append(item)
-
-    site_netloc   = urlparse(next(iter(product_map))).netloc if product_map else "site"
-    product_names = product_order
-
+    # Flat list — no header block, no category sections
     lines = []
-    lines.append(f"# Source: {site_netloc}")
-    if len(product_names) == 1:
-        lines.append(f"# Product: {product_names[0]}")
-        lines.append(f"# Purpose: Provides structured, descriptive summary of {product_names[0]} — covering product pages, features, documentation, and support for AI-based indexing and referencing.")
-    else:
-        lines.append(f"# Products: {', '.join(product_names)}")
-        lines.append(f"# Purpose: Provides structured, descriptive summaries of {', '.join(product_names)} — covering product pages, features, documentation, and support for AI-based indexing and referencing.")
-    lines.append(f"# Generated: {datetime.utcnow().strftime('%Y-%m-%d')} | Total Pages: {len(deduped)}")
-    lines.append("")
-
-    for product_name in product_order:
-        items = grouped[product_name]
-        if len(product_order) > 1:
-            lines.append(f"## {product_name}")
-            lines.append("")
-        for item in items:
-            lines.append(f"- Source: {item['url']}")
-            lines.append(f"  Title: {item['title']}")
-            lines.append(f"  Description: {item['description']}")
-            lines.append("")
+    for item in deduped:
+        lines.append(f"- Source: {item['url']}")
+        lines.append(f"  Title: {item['title']}")
+        lines.append(f"  Description: {item['description']}")
+        lines.append("")
 
     return "\n".join(lines)
 
