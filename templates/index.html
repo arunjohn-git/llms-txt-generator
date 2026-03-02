@@ -33,6 +33,13 @@
       cursor: pointer; transition: all 0.2s;
     }
     .tab.active { background: #6c47ff; border-color: #6c47ff; color: #fff; }
+    .upload-area {
+      border: 2px dashed #d5d5d5; border-radius: 12px; padding: 32px;
+      text-align: center; cursor: pointer; transition: all 0.2s;
+      margin-bottom: 24px; position: relative; background: #fafafa;
+    }
+    .upload-area.drag-over { border-color: #6c47ff; background: #f5f2ff; }
+    .upload-area input[type="file"] { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
     #submitBtn {
       width: 100%; padding: 14px; background: #6c47ff; color: #fff;
       border: none; border-radius: 10px; font-size: 15px; font-weight: 700;
@@ -50,10 +57,10 @@
     }
     .stage-step.active { background: #6c47ff; color: #fff; }
     .stage-step.done { background: #ecfdf5; color: #065f46; }
-    .progress-track { background: #f0ecff; border-radius: 99px; height: 8px; overflow: hidden; }
-    .progress-fill { background: linear-gradient(90deg, #6c47ff, #a78bfa); height: 100%; width: 0%; transition: width 0.5s ease; }
+    .progress-track { background: #f0ecff; border-radius: 99px; height: 8px; overflow: hidden; margin: 10px 0; }
+    .progress-fill { background: linear-gradient(90deg, #6c47ff, #a78bfa); height: 100%; width: 0%; transition: width 0.5s; }
     .log-area { background: #1e1e2e; padding: 12px 14px; max-height: 200px; overflow-y: auto; border-radius: 0 0 10px 10px; }
-    .log-line { font-family: monospace; font-size: 12px; line-height: 1.8; color: #94a3b8; }
+    .log-line { font-family: monospace; font-size: 11px; line-height: 1.8; color: #94a3b8; }
     .log-line.stage { color: #60cdff; font-weight: bold; }
     .result-box {
       display: none; margin-top: 20px; padding: 18px 20px;
@@ -66,15 +73,29 @@
 <body>
 <div class="card">
   <div class="logo">llms<span>.txt</span> Generator</div>
-  <div class="subtitle">Cloud Edition — Powered by GPT-4o-mini</div>
+  <div class="subtitle">Cloud Edition — Replicating Local Setup</div>
   <div class="badge">⚡ Production Ready</div>
 
   <form id="genForm">
     <div class="tabs">
-      <button type="button" class="tab active">🌐 Direct URL</button>
+      <button type="button" class="tab active" onclick="switchTab(this, 'csv')">📄 CSV Upload</button>
+      <button type="button" class="tab" onclick="switchTab(this, 'sitemap')">🗺 Sitemap URL</button>
     </div>
-    <input type="url" id="target_url" name="url" placeholder="https://yoursite.com/docs" 
-           style="width:100%; padding:12px; border:1.5px solid #e0e0e0; border-radius:10px; margin-bottom:20px; outline:none;">
+
+    <div id="panel-csv" class="tab-panel">
+      <div class="upload-area" id="uploadArea">
+        <input type="file" id="csv_file" name="csv_file" accept=".csv">
+        <div>📄 Click or Drag CSV</div>
+        <div id="fileName" style="font-size: 12px; color: #6c47ff; margin-top: 8px;"></div>
+      </div>
+    </div>
+
+    <div id="panel-sitemap" class="tab-panel" style="display:none">
+      <input type="url" id="url" name="url" placeholder="https://site.com/sitemap.xml" 
+             style="width:100%; padding:12px; border:1.5px solid #e0e0e0; border-radius:10px; margin-bottom:20px;">
+    </div>
+
+    <input type="hidden" name="input_mode" id="input_mode" value="csv">
     <button type="submit" id="submitBtn">Generate llms.txt</button>
   </form>
 
@@ -86,7 +107,7 @@
       <div class="stage-step" id="step-generate">📄 Generating</div>
     </div>
     <div class="progress-track"><div class="progress-fill" id="progressFill"></div></div>
-    <div id="progressLabel" style="font-size:13px; margin:10px 0; font-weight:bold;">Starting...</div>
+    <div id="progressLabel" style="font-size:12px; font-weight:bold; margin-bottom:10px;">Ready</div>
     <div class="log-area" id="logArea"></div>
     
     <div class="result-box" id="resultBox">
@@ -97,47 +118,49 @@
 </div>
 
 <script>
-  let jobId = null;
+  /* Logic adapted for cloud streaming */
+  let currentJobId = null;
   const STAGES = ['fetch', 'summarize', 'qa', 'generate'];
 
-  function setStage(name) {
-    let passed = true;
-    STAGES.forEach(s => {
-      const el = document.getElementById('step-' + s);
-      el.classList.remove('active', 'done');
-      if (name.includes(s)) { el.classList.add('active'); passed = false; }
-      else if (passed) el.classList.add('done');
-    });
+  function switchTab(btn, mode) {
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    btn.classList.add('active');
+    document.getElementById('input_mode').value = mode;
+    document.getElementById('panel-csv').style.display = mode === 'csv' ? 'block' : 'none';
+    document.getElementById('panel-sitemap').style.display = mode === 'sitemap' ? 'block' : 'none';
   }
+
+  // File label update
+  document.getElementById('csv_file').addEventListener('change', function() {
+    document.getElementById('fileName').textContent = this.files[0] ? '✓ ' + this.files[0].name : '';
+  });
 
   document.getElementById('genForm').addEventListener('submit', async (e) => {
     e.preventDefault();
     const btn = document.getElementById('submitBtn');
-    const url = document.getElementById('target_url').value;
+    const log = document.getElementById('logArea');
     
     btn.disabled = true;
     document.getElementById('progressPanel').style.display = 'block';
-    document.getElementById('logArea').innerHTML = '';
+    log.innerHTML = '';
     
-    // Start Cloud Pipeline
-    const res = await fetch('/start', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ url: url })
-    });
+    // Send form data (supports file upload)
+    const formData = new FormData(e.target);
+    const res = await fetch('/start', { method: 'POST', body: formData });
     const data = await res.json();
-    jobId = data.job_id;
+    currentJobId = data.job_id;
 
-    const evtSource = new EventSource('/progress/' + jobId);
-    evtSource.onmessage = (e) => {
-      const d = JSON.parse(e.data);
+    // Listen to streaming progress
+    const evtSource = new EventSource('/progress/' + currentJobId);
+    evtSource.onmessage = (event) => {
+      const d = JSON.parse(event.data);
       if (d.type === 'stage') {
-        setStage(d.msg.toLowerCase());
+        updateStages(d.msg.toLowerCase());
         document.getElementById('progressLabel').innerText = d.msg;
-        document.getElementById('progressFill').style.width = (d.pct || 0) + '%';
+        document.getElementById('progressFill').style.width = d.pct + '%';
         addLog(d.msg, 'stage');
       } else if (d.type === 'fetch' || d.type === 'summarize') {
-        addLog(`${d.ok ? '✓' : '✗'} ${d.url}`);
+        addLog(`${d.ok ? '✓' : '✗'} [${d.current}/${d.total}] ${d.url}`);
       } else if (d.type === 'done') {
         evtSource.close();
         document.getElementById('resultBox').classList.add('show');
@@ -145,6 +168,16 @@
       }
     };
   });
+
+  function updateStages(msg) {
+    let passed = true;
+    STAGES.forEach(s => {
+      const el = document.getElementById('step-' + s);
+      el.classList.remove('active', 'done');
+      if (msg.includes(s)) { el.classList.add('active'); passed = false; }
+      else if (passed) el.classList.add('done');
+    });
+  }
 
   function addLog(msg, type='') {
     const area = document.getElementById('logArea');
@@ -156,7 +189,7 @@
   }
 
   document.getElementById('downloadBtn').onclick = () => {
-    window.location.href = '/download/' + jobId;
+    window.location.href = '/download/' + currentJobId;
   };
 </script>
 </body>
