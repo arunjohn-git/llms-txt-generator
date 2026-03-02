@@ -2,100 +2,96 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>llms.txt Generator</title>
     <style>
-        body { font-family: -apple-system, sans-serif; max-width: 800px; margin: 40px auto; padding: 20px; background: #f4f7f9; }
-        .card { background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
-        .input-group { display: flex; gap: 10px; margin: 20px 0; }
-        input { flex: 1; padding: 12px; border: 1px solid #ddd; border-radius: 6px; }
-        button { background: #2ea44f; color: white; border: none; padding: 12px 24px; border-radius: 6px; cursor: pointer; font-weight: bold; }
-        button:disabled { background: #94d3a2; }
-        .progress-container { width: 100%; background: #eee; border-radius: 10px; margin: 20px 0; display: none; height: 20px; overflow: hidden; }
-        #progress-bar { width: 0%; height: 100%; background: #0366d6; transition: width 0.3s; }
-        #log { background: #1e1e1e; color: #00ff00; padding: 15px; height: 200px; overflow-y: auto; border-radius: 6px; font-family: monospace; font-size: 12px; }
-        .success-area { display: none; margin-top: 20px; padding: 15px; background: #e6ffed; border: 1px solid #bef5cb; border-radius: 6px; }
+        body { font-family: -apple-system, sans-serif; max-width: 700px; margin: 40px auto; padding: 20px; background: #f0f2f8; }
+        .card { background: #fff; border-radius: 15px; padding: 40px; box-shadow: 0 4px 20px rgba(0,0,0,0.08); }
+        .stages { display: flex; margin-bottom: 25px; border: 1px solid #e5e7eb; border-radius: 10px; overflow: hidden; }
+        .stage-step { flex: 1; padding: 12px; text-align: center; font-size: 11px; font-weight: bold; color: #aaa; background: #f9fafb; border-right: 1px solid #e5e7eb; }
+        .stage-step.active { background: #6c47ff; color: #fff; }
+        .stage-step.done { background: #ecfdf5; color: #065f46; }
+        .progress-track { background: #f0ecff; height: 10px; border-radius: 10px; overflow: hidden; margin: 15px 0; }
+        .progress-fill { background: #6c47ff; height: 100%; width: 0%; transition: width 0.4s; }
+        #logArea { background: #1e1e2e; color: #4ade80; padding: 15px; height: 200px; overflow-y: auto; border-radius: 8px; font-family: monospace; font-size: 12px; margin-top: 15px; }
+        input { width: 75%; padding: 12px; border: 1px solid #ddd; border-radius: 8px; }
+        button { padding: 12px 20px; background: #6c47ff; color: white; border: none; border-radius: 8px; cursor: pointer; font-weight: bold; }
+        .download-box { display: none; margin-top: 20px; padding: 20px; background: #f0fdf4; border: 1px solid #6ee7b7; border-radius: 10px; text-align: center; }
     </style>
 </head>
 <body>
     <div class="card">
-        <h1>llms.txt Generator</h1>
-        <div class="input-group">
-            <input type="text" id="url" placeholder="Enter website URL (e.g., ManageEngine docs)">
-            <button id="genBtn" onclick="startGeneration()">Generate</button>
+        <h2>llms.txt Generator <span>(Cloud)</span></h2>
+        <div style="margin: 20px 0;">
+            <input type="text" id="urlInput" placeholder="Enter URL to crawl...">
+            <button id="startBtn" onclick="runPipeline()">Generate</button>
         </div>
 
-        <div class="progress-container" id="pContainer">
-            <div id="progress-bar"></div>
+        <div class="stages">
+            <div class="stage-step" id="step-fetch">🌐 Fetching</div>
+            <div class="stage-step" id="step-summarize">🤖 Summarizing</div>
+            <div class="stage-step" id="step-qa">✅ QA & Fix</div>
+            <div class="stage-step" id="step-generate">📄 Generating</div>
         </div>
-        <p id="stats">Status: Ready</p>
-        <div id="log">Logs will appear here...</div>
 
-        <div id="successArea" class="success-area">
-            <h3 style="margin-top:0">✅ Generation Complete!</h3>
-            <button onclick="downloadFile()" style="background: #0366d6">Download llms.txt</button>
+        <div class="progress-track"><div class="progress-fill" id="progressFill"></div></div>
+        <div id="stats">Ready</div>
+        <div id="logArea">Waiting for input...</div>
+
+        <div id="downloadBox" class="download-box">
+            <p>🎉 Your llms.txt is ready!</p>
+            <button onclick="downloadFile()" style="background: #059669;">Download llms.txt</button>
         </div>
     </div>
 
     <script>
-        let finalOutput = "";
+        let currentJobId = null;
 
-        async function startGeneration() {
-            const url = document.getElementById('url').value;
-            const btn = document.getElementById('genBtn');
-            const log = document.getElementById('log');
-            const bar = document.getElementById('progress-bar');
-            const stats = document.getElementById('stats');
+        async function runPipeline() {
+            const url = document.getElementById('urlInput').value;
+            if(!url) return alert("Enter a URL");
+
+            document.getElementById('startBtn').disabled = true;
+            document.getElementById('logArea').innerHTML = "<div>Initializing pipeline...</div>";
             
-            if(!url) return alert("Please enter a URL");
+            // 1. Start the job
+            const formData = new FormData();
+            formData.append('url', url);
+            const res = await fetch('/start', { method: 'POST', body: formData });
+            const data = await res.json();
+            currentJobId = data.job_id;
 
-            btn.disabled = true;
-            document.getElementById('pContainer').style.display = 'block';
-            document.getElementById('successArea').style.display = 'none';
-            log.innerHTML = "<div>Starting stream...</div>";
+            // 2. Listen to progress stream
+            const evtSource = new EventSource('/progress/' + currentJobId);
+            evtSource.onmessage = function(e) {
+                const d = JSON.parse(e.data);
+                if (d.type === 'stage') {
+                    updateStage(d.msg);
+                    document.getElementById('progressFill').style.width = d.pct + '%';
+                    document.getElementById('logArea').innerHTML += `<div style="color:#60cdff">> ${d.msg}</div>`;
+                } else if (d.type === 'fetch' || d.type === 'summarize') {
+                    document.getElementById('stats').innerText = `${d.current} / ${d.total}`;
+                    document.getElementById('logArea').innerHTML += `<div>${d.ok ? '✓' : '✗'} ${d.url}</div>`;
+                } else if (d.type === 'done') {
+                    evtSource.close();
+                    document.getElementById('downloadBox').style.display = 'block';
+                    document.getElementById('startBtn').disabled = false;
+                }
+                const log = document.getElementById('logArea');
+                log.scrollTop = log.scrollHeight;
+            };
+        }
 
-            const response = await fetch('/generate-stream', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ url: url })
+        function updateStage(msg) {
+            const stages = ['fetch', 'summarize', 'qa', 'generate'];
+            stages.forEach(s => {
+                const el = document.getElementById('step-' + s);
+                el.classList.remove('active');
+                if(msg.toLowerCase().includes(s)) el.classList.add('active');
             });
-
-            const reader = response.body.getReader();
-            const decoder = new TextDecoder();
-
-            while (true) {
-                const { value, done } = await reader.read();
-                if (done) break;
-                
-                const lines = decoder.decode(value).split('\n');
-                lines.forEach(line => {
-                    if (line.startsWith('data: ')) {
-                        const data = JSON.parse(line.replace('data: ', ''));
-                        if (data.type === 'progress') {
-                            bar.style.width = data.percent + '%';
-                            stats.innerText = `Elapsed: ${data.elapsed}s | Batch: ${data.batch}/${data.total}`;
-                            log.innerHTML += `<div>[${data.elapsed}s] Processed batch ${data.batch}</div>`;
-                            log.scrollTop = log.scrollHeight;
-                        } else if (data.type === 'final') {
-                            finalOutput = data.content;
-                            document.getElementById('successArea').style.display = 'block';
-                            btn.disabled = false;
-                        } else if (data.type === 'error') {
-                            log.innerHTML += `<div style="color:red">Error: ${data.msg}</div>`;
-                            btn.disabled = false;
-                        }
-                    }
-                });
-            }
         }
 
         function downloadFile() {
-            const blob = new Blob([finalOutput], { type: 'text/plain' });
-            const url = window.URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = 'llms.txt';
-            a.click();
+            window.location.href = '/download/' + currentJobId;
         }
     </script>
 </body>
