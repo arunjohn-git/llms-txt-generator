@@ -1,98 +1,163 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <title>llms.txt Generator</title>
-    <style>
-        body { font-family: -apple-system, sans-serif; max-width: 700px; margin: 40px auto; padding: 20px; background: #f0f2f8; }
-        .card { background: #fff; border-radius: 15px; padding: 40px; box-shadow: 0 4px 20px rgba(0,0,0,0.08); }
-        .stages { display: flex; margin-bottom: 25px; border: 1px solid #e5e7eb; border-radius: 10px; overflow: hidden; }
-        .stage-step { flex: 1; padding: 12px; text-align: center; font-size: 11px; font-weight: bold; color: #aaa; background: #f9fafb; border-right: 1px solid #e5e7eb; }
-        .stage-step.active { background: #6c47ff; color: #fff; }
-        .stage-step.done { background: #ecfdf5; color: #065f46; }
-        .progress-track { background: #f0ecff; height: 10px; border-radius: 10px; overflow: hidden; margin: 15px 0; }
-        .progress-fill { background: #6c47ff; height: 100%; width: 0%; transition: width 0.4s; }
-        #logArea { background: #1e1e2e; color: #4ade80; padding: 15px; height: 200px; overflow-y: auto; border-radius: 8px; font-family: monospace; font-size: 12px; margin-top: 15px; }
-        input { width: 75%; padding: 12px; border: 1px solid #ddd; border-radius: 8px; }
-        button { padding: 12px 20px; background: #6c47ff; color: white; border: none; border-radius: 8px; cursor: pointer; font-weight: bold; }
-        .download-box { display: none; margin-top: 20px; padding: 20px; background: #f0fdf4; border: 1px solid #6ee7b7; border-radius: 10px; text-align: center; }
-    </style>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>llms.txt Generator</title>
+  <style>
+    /* Exact CSS from your local app_local.py */
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: #f0f2f8; min-height: 100vh;
+      display: flex; align-items: flex-start; justify-content: center; padding: 40px 24px;
+    }
+    .card {
+      background: #fff; border-radius: 20px;
+      box-shadow: 0 4px 32px rgba(0,0,0,0.09);
+      padding: 48px; width: 100%; max-width: 640px;
+    }
+    .logo { font-size: 26px; font-weight: 800; color: #1a1a2e; margin-bottom: 4px; }
+    .logo span { color: #6c47ff; }
+    .subtitle { color: #777; font-size: 14px; margin-bottom: 24px; }
+    .badge {
+      display: inline-flex; align-items: center; gap: 6px;
+      background: #f0fdf4; color: #166534; border: 1px solid #bbf7d0;
+      border-radius: 20px; font-size: 11px; font-weight: 700;
+      padding: 3px 12px; margin-bottom: 28px;
+    }
+    .tabs { display: flex; gap: 8px; margin-bottom: 16px; }
+    .tab {
+      flex: 1; padding: 9px 12px; border-radius: 8px; border: 1.5px solid #e0e0e0;
+      background: #fafafa; font-size: 12px; font-weight: 600; color: #888;
+      cursor: pointer; transition: all 0.2s;
+    }
+    .tab.active { background: #6c47ff; border-color: #6c47ff; color: #fff; }
+    #submitBtn {
+      width: 100%; padding: 14px; background: #6c47ff; color: #fff;
+      border: none; border-radius: 10px; font-size: 15px; font-weight: 700;
+      cursor: pointer; transition: background 0.2s;
+    }
+    #progressPanel { display: none; margin-top: 32px; }
+    .stages {
+      display: flex; margin-bottom: 24px;
+      border-radius: 10px; overflow: hidden; border: 1px solid #e5e7eb;
+    }
+    .stage-step {
+      flex: 1; padding: 10px 6px; text-align: center;
+      font-size: 11px; font-weight: 600; color: #aaa;
+      background: #f9fafb; border-right: 1px solid #e5e7eb;
+    }
+    .stage-step.active { background: #6c47ff; color: #fff; }
+    .stage-step.done { background: #ecfdf5; color: #065f46; }
+    .progress-track { background: #f0ecff; border-radius: 99px; height: 8px; overflow: hidden; }
+    .progress-fill { background: linear-gradient(90deg, #6c47ff, #a78bfa); height: 100%; width: 0%; transition: width 0.5s ease; }
+    .log-area { background: #1e1e2e; padding: 12px 14px; max-height: 200px; overflow-y: auto; border-radius: 0 0 10px 10px; }
+    .log-line { font-family: monospace; font-size: 12px; line-height: 1.8; color: #94a3b8; }
+    .log-line.stage { color: #60cdff; font-weight: bold; }
+    .result-box {
+      display: none; margin-top: 20px; padding: 18px 20px;
+      background: #f0fdf4; border: 1.5px solid #6ee7b7; border-radius: 12px;
+      align-items: center; justify-content: space-between;
+    }
+    .result-box.show { display: flex; }
+  </style>
 </head>
 <body>
-    <div class="card">
-        <h2>llms.txt Generator <span>(Cloud)</span></h2>
-        <div style="margin: 20px 0;">
-            <input type="text" id="urlInput" placeholder="Enter URL to crawl...">
-            <button id="startBtn" onclick="runPipeline()">Generate</button>
-        </div>
+<div class="card">
+  <div class="logo">llms<span>.txt</span> Generator</div>
+  <div class="subtitle">Cloud Edition — Powered by GPT-4o-mini</div>
+  <div class="badge">⚡ Production Ready</div>
 
-        <div class="stages">
-            <div class="stage-step" id="step-fetch">🌐 Fetching</div>
-            <div class="stage-step" id="step-summarize">🤖 Summarizing</div>
-            <div class="stage-step" id="step-qa">✅ QA & Fix</div>
-            <div class="stage-step" id="step-generate">📄 Generating</div>
-        </div>
-
-        <div class="progress-track"><div class="progress-fill" id="progressFill"></div></div>
-        <div id="stats">Ready</div>
-        <div id="logArea">Waiting for input...</div>
-
-        <div id="downloadBox" class="download-box">
-            <p>🎉 Your llms.txt is ready!</p>
-            <button onclick="downloadFile()" style="background: #059669;">Download llms.txt</button>
-        </div>
+  <form id="genForm">
+    <div class="tabs">
+      <button type="button" class="tab active">🌐 Direct URL</button>
     </div>
+    <input type="url" id="target_url" name="url" placeholder="https://yoursite.com/docs" 
+           style="width:100%; padding:12px; border:1.5px solid #e0e0e0; border-radius:10px; margin-bottom:20px; outline:none;">
+    <button type="submit" id="submitBtn">Generate llms.txt</button>
+  </form>
 
-    <script>
-        let currentJobId = null;
+  <div id="progressPanel">
+    <div class="stages">
+      <div class="stage-step" id="step-fetch">🌐 Fetching</div>
+      <div class="stage-step" id="step-summarize">🤖 Summarising</div>
+      <div class="stage-step" id="step-qa">✅ QA & Fix</div>
+      <div class="stage-step" id="step-generate">📄 Generating</div>
+    </div>
+    <div class="progress-track"><div class="progress-fill" id="progressFill"></div></div>
+    <div id="progressLabel" style="font-size:13px; margin:10px 0; font-weight:bold;">Starting...</div>
+    <div class="log-area" id="logArea"></div>
+    
+    <div class="result-box" id="resultBox">
+      <div style="font-size:13px; color:#065f46;">🎉 llms.txt is ready!</div>
+      <button id="downloadBtn" style="background:#059669; color:white; border:none; padding:8px 16px; border-radius:8px; cursor:pointer;">Download</button>
+    </div>
+  </div>
+</div>
 
-        async function runPipeline() {
-            const url = document.getElementById('urlInput').value;
-            if(!url) return alert("Enter a URL");
+<script>
+  let jobId = null;
+  const STAGES = ['fetch', 'summarize', 'qa', 'generate'];
 
-            document.getElementById('startBtn').disabled = true;
-            document.getElementById('logArea').innerHTML = "<div>Initializing pipeline...</div>";
-            
-            // 1. Start the job
-            const formData = new FormData();
-            formData.append('url', url);
-            const res = await fetch('/start', { method: 'POST', body: formData });
-            const data = await res.json();
-            currentJobId = data.job_id;
+  function setStage(name) {
+    let passed = true;
+    STAGES.forEach(s => {
+      const el = document.getElementById('step-' + s);
+      el.classList.remove('active', 'done');
+      if (name.includes(s)) { el.classList.add('active'); passed = false; }
+      else if (passed) el.classList.add('done');
+    });
+  }
 
-            // 2. Listen to progress stream
-            const evtSource = new EventSource('/progress/' + currentJobId);
-            evtSource.onmessage = function(e) {
-                const d = JSON.parse(e.data);
-                if (d.type === 'stage') {
-                    updateStage(d.msg);
-                    document.getElementById('progressFill').style.width = d.pct + '%';
-                    document.getElementById('logArea').innerHTML += `<div style="color:#60cdff">> ${d.msg}</div>`;
-                } else if (d.type === 'fetch' || d.type === 'summarize') {
-                    document.getElementById('stats').innerText = `${d.current} / ${d.total}`;
-                    document.getElementById('logArea').innerHTML += `<div>${d.ok ? '✓' : '✗'} ${d.url}</div>`;
-                } else if (d.type === 'done') {
-                    evtSource.close();
-                    document.getElementById('downloadBox').style.display = 'block';
-                    document.getElementById('startBtn').disabled = false;
-                }
-                const log = document.getElementById('logArea');
-                log.scrollTop = log.scrollHeight;
-            };
-        }
+  document.getElementById('genForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const btn = document.getElementById('submitBtn');
+    const url = document.getElementById('target_url').value;
+    
+    btn.disabled = true;
+    document.getElementById('progressPanel').style.display = 'block';
+    document.getElementById('logArea').innerHTML = '';
+    
+    // Start Cloud Pipeline
+    const res = await fetch('/start', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ url: url })
+    });
+    const data = await res.json();
+    jobId = data.job_id;
 
-        function updateStage(msg) {
-            const stages = ['fetch', 'summarize', 'qa', 'generate'];
-            stages.forEach(s => {
-                const el = document.getElementById('step-' + s);
-                el.classList.remove('active');
-                if(msg.toLowerCase().includes(s)) el.classList.add('active');
-            });
-        }
+    const evtSource = new EventSource('/progress/' + jobId);
+    evtSource.onmessage = (e) => {
+      const d = JSON.parse(e.data);
+      if (d.type === 'stage') {
+        setStage(d.msg.toLowerCase());
+        document.getElementById('progressLabel').innerText = d.msg;
+        document.getElementById('progressFill').style.width = (d.pct || 0) + '%';
+        addLog(d.msg, 'stage');
+      } else if (d.type === 'fetch' || d.type === 'summarize') {
+        addLog(`${d.ok ? '✓' : '✗'} ${d.url}`);
+      } else if (d.type === 'done') {
+        evtSource.close();
+        document.getElementById('resultBox').classList.add('show');
+        btn.disabled = false;
+      }
+    };
+  });
 
-        function downloadFile() {
-            window.location.href = '/download/' + currentJobId;
-        }
-    </script>
+  function addLog(msg, type='') {
+    const area = document.getElementById('logArea');
+    const line = document.createElement('div');
+    line.className = 'log-line ' + type;
+    line.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+    area.appendChild(line);
+    area.scrollTop = area.scrollHeight;
+  }
+
+  document.getElementById('downloadBtn').onclick = () => {
+    window.location.href = '/download/' + jobId;
+  };
+</script>
 </body>
 </html>
