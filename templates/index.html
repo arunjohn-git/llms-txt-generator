@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>llms.txt Generator</title>
+    <style>
+        body { font-family: -apple-system, sans-serif; max-width: 800px; margin: 40px auto; padding: 20px; background: #f4f7f9; }
+        .card { background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+        .input-group { display: flex; gap: 10px; margin: 20px 0; }
+        input { flex: 1; padding: 12px; border: 1px solid #ddd; border-radius: 6px; }
+        button { background: #2ea44f; color: white; border: none; padding: 12px 24px; border-radius: 6px; cursor: pointer; font-weight: bold; }
+        button:disabled { background: #94d3a2; }
+        .progress-container { width: 100%; background: #eee; border-radius: 10px; margin: 20px 0; display: none; height: 20px; overflow: hidden; }
+        #progress-bar { width: 0%; height: 100%; background: #0366d6; transition: width 0.3s; }
+        #log { background: #1e1e1e; color: #00ff00; padding: 15px; height: 200px; overflow-y: auto; border-radius: 6px; font-family: monospace; font-size: 12px; }
+        .success-area { display: none; margin-top: 20px; padding: 15px; background: #e6ffed; border: 1px solid #bef5cb; border-radius: 6px; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>llms.txt Generator</h1>
+        <div class="input-group">
+            <input type="text" id="url" placeholder="Enter website URL (e.g., ManageEngine docs)">
+            <button id="genBtn" onclick="startGeneration()">Generate</button>
+        </div>
+
+        <div class="progress-container" id="pContainer">
+            <div id="progress-bar"></div>
+        </div>
+        <p id="stats">Status: Ready</p>
+        <div id="log">Logs will appear here...</div>
+
+        <div id="successArea" class="success-area">
+            <h3 style="margin-top:0">✅ Generation Complete!</h3>
+            <button onclick="downloadFile()" style="background: #0366d6">Download llms.txt</button>
+        </div>
+    </div>
+
+    <script>
+        let finalOutput = "";
+
+        async function startGeneration() {
+            const url = document.getElementById('url').value;
+            const btn = document.getElementById('genBtn');
+            const log = document.getElementById('log');
+            const bar = document.getElementById('progress-bar');
+            const stats = document.getElementById('stats');
+            
+            if(!url) return alert("Please enter a URL");
+
+            btn.disabled = true;
+            document.getElementById('pContainer').style.display = 'block';
+            document.getElementById('successArea').style.display = 'none';
+            log.innerHTML = "<div>Starting stream...</div>";
+
+            const response = await fetch('/generate-stream', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ url: url })
+            });
+
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+
+            while (true) {
+                const { value, done } = await reader.read();
+                if (done) break;
+                
+                const lines = decoder.decode(value).split('\n');
+                lines.forEach(line => {
+                    if (line.startsWith('data: ')) {
+                        const data = JSON.parse(line.replace('data: ', ''));
+                        if (data.type === 'progress') {
+                            bar.style.width = data.percent + '%';
+                            stats.innerText = `Elapsed: ${data.elapsed}s | Batch: ${data.batch}/${data.total}`;
+                            log.innerHTML += `<div>[${data.elapsed}s] Processed batch ${data.batch}</div>`;
+                            log.scrollTop = log.scrollHeight;
+                        } else if (data.type === 'final') {
+                            finalOutput = data.content;
+                            document.getElementById('successArea').style.display = 'block';
+                            btn.disabled = false;
+                        } else if (data.type === 'error') {
+                            log.innerHTML += `<div style="color:red">Error: ${data.msg}</div>`;
+                            btn.disabled = false;
+                        }
+                    }
+                });
+            }
+        }
+
+        function downloadFile() {
+            const blob = new Blob([finalOutput], { type: 'text/plain' });
+            const url = window.URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'llms.txt';
+            a.click();
+        }
+    </script>
+</body>
+</html>
