@@ -1054,8 +1054,14 @@ HTML = """<!DOCTYPE html>
       btn.disabled = false; btn.textContent = 'Generate llms.txt'; return
     }
 
-    const evtSource = new EventSource('/progress/' + jobId)
-    evtSource.onmessage = function(e) {
+    let evtSource = null
+    let sseRetries = 0
+    const MAX_RETRIES = 20
+
+    function connectSSE() {
+      if (evtSource) evtSource.close()
+      evtSource = new EventSource('/progress/' + jobId)
+      evtSource.onmessage = function(e) {
       const d = JSON.parse(e.data)
       if (d.type === 'ping') return
 
@@ -1082,6 +1088,7 @@ HTML = """<!DOCTYPE html>
         setProgress('LLM Scoring & Rewriting', 90 + Math.round((d.current/d.total)*7), `${d.current} / ${d.total}`)
 
       } else if (d.type === 'done') {
+        sseRetries = MAX_RETRIES  // stop reconnecting
         evtSource.close()
         STAGES.forEach(s => {
           const el = document.getElementById('step-' + s)
@@ -1098,12 +1105,24 @@ HTML = """<!DOCTYPE html>
         btn.disabled = false; btn.textContent = 'Generate llms.txt'
 
       } else if (d.type === 'error') {
+        sseRetries = MAX_RETRIES  // stop reconnecting
         evtSource.close()
         showError(d.msg)
         btn.disabled = false; btn.textContent = 'Generate llms.txt'
       }
     }
-    evtSource.onerror = () => evtSource.close()
+      evtSource.onerror = function() {
+        evtSource.close()
+        if (sseRetries < MAX_RETRIES) {
+          sseRetries++
+          addLog(`↻ Connection dropped — reconnecting (${sseRetries}/${MAX_RETRIES})...`, 'stage')
+          setTimeout(connectSSE, 2000 * sseRetries)
+        } else {
+          showError('Connection lost after multiple retries. The job may still be running — try refreshing and checking /download/' + jobId)
+        }
+      }
+    }
+    connectSSE()
   })
 
   document.getElementById('downloadBtn')?.addEventListener('click', function() {
@@ -1292,7 +1311,7 @@ def progress(job_id):
         q   = job["queue"]
         while True:
             try:
-                msg = q.get(timeout=60)
+                msg = q.get(timeout=15)
                 yield f"data: {json.dumps(msg)}\n\n"
                 if msg["type"] in ("done", "error"):
                     break
