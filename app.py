@@ -964,7 +964,7 @@ def start():
     if input_mode == "csv":
         if "csv_file" not in request.files:
             return jsonify({"error": "No CSV file uploaded"}), 400
-        stream   = io.StringIO(request.files["csv_file"].stream.read().decode("utf-8"))
+        stream   = io.StringIO(request.files["csv_file"].stream.read().decode("utf-8-sig"))
         urls_raw = [cell.strip() for row in csv.reader(stream) for cell in row if cell.strip().startswith("http")]
 
     elif input_mode == "sitemap":
