@@ -9,7 +9,6 @@ import threading
 import queue
 from flask import Flask, request, render_template_string, send_file, jsonify, Response, stream_with_context, session
 from collections import Counter, defaultdict
-from datetime import datetime
 from urllib.parse import urlparse, urlunparse
 from openai import OpenAI
 
@@ -17,30 +16,24 @@ app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "llms-txt-secret-2024")
 app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024
 
-# ── Config from environment ──
-APP_PASSWORD    = os.environ.get("APP_PASSWORD", "")          # If set, require login
-OPENAI_API_KEY  = os.environ.get("OPENAI_API_KEY", "")        # Can also be supplied per-request
-MODEL           = "gpt-4o-mini"
-HEADERS         = {"User-Agent": "Mozilla/5.0 (compatible; llms-txt-generator/1.0)"}
-jobs            = {}
+APP_PASSWORD   = os.environ.get("APP_PASSWORD", "")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+MODEL          = "gpt-4o-mini"
+HEADERS        = {"User-Agent": "Mozilla/5.0 (compatible; llms-txt-generator/1.0)"}
+jobs           = {}
 
 # ─────────────────────────────────────────────────────
-# OPENAI CALL
+# LLM
 # ─────────────────────────────────────────────────────
 def call_llm(prompt, api_key):
-    import logging
     client = OpenAI(api_key=api_key)
-    try:
-        response = client.chat.completions.create(
-            model=MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
-            max_tokens=600,
-        )
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        logging.error(f"OpenAI API error: {e}")
-        raise
+    response = client.chat.completions.create(
+        model=MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2,
+        max_tokens=600,
+    )
+    return response.choices[0].message.content.strip()
 
 # ─────────────────────────────────────────────────────
 # URL UTILITIES
@@ -52,15 +45,6 @@ def clean_url(url):
         return urlunparse((parsed.scheme, parsed.netloc, path, '', '', ''))
     except:
         return url
-
-def dedupe_urls(urls):
-    seen = set()
-    out  = []
-    for u in urls:
-        if u not in seen:
-            seen.add(u)
-            out.append(u)
-    return out
 
 # ─────────────────────────────────────────────────────
 # SITEMAP PARSING
@@ -102,95 +86,6 @@ def parse_sitemap(source, is_file=False):
             return [], str(e)
 
     return extract_urls(xml_text), None
-
-# ─────────────────────────────────────────────────────
-# PRODUCT / GROUP DETECTION
-# ─────────────────────────────────────────────────────
-def find_divergence_depth(urls):
-    parsed_paths = []
-    for url in urls:
-        parts = [p for p in urlparse(url).path.strip('/').split('/') if p]
-        parsed_paths.append(parts)
-
-    if not parsed_paths:
-        return 1
-
-    min_depth = min(len(p) for p in parsed_paths)
-    if min_depth == 0:
-        return 1
-
-    common_depth = 0
-    for depth in range(min_depth):
-        vals = set(p[depth] for p in parsed_paths if len(p) > depth)
-        if len(vals) == 1:
-            common_depth = depth + 1
-        else:
-            break
-
-    return max(common_depth + 1, 1)
-
-def build_product_map(urls):
-    if not urls:
-        return {}
-
-    domain_groups = defaultdict(list)
-    for url in urls:
-        domain_groups[urlparse(url).netloc].append(url)
-
-    product_map = {}
-
-    for domain, domain_urls in domain_groups.items():
-        depth = find_divergence_depth(domain_urls)
-
-        groups = defaultdict(list)
-        for url in domain_urls:
-            parsed = urlparse(url)
-            parts  = [p for p in parsed.path.strip('/').split('/') if p]
-            key    = '/'.join(parts[:depth]) if len(parts) >= depth else '/'.join(parts)
-            groups[key].append(url)
-
-        scheme = urlparse(domain_urls[0]).scheme
-
-        for key, group_urls in groups.items():
-            base_url = f"{scheme}://{domain}/{key}/" if key else f"{scheme}://{domain}/"
-            name     = fetch_group_name(base_url, key, domain)
-            for url in group_urls:
-                parsed = urlparse(url)
-                parts  = [p for p in parsed.path.strip('/').split('/') if p]
-                prefix = f"{parsed.scheme}://{parsed.netloc}/{'/'.join(parts[:-1])}/" if parts else base_url
-                product_map[prefix] = name
-
-    return product_map
-
-def fetch_group_name(base_url, path_key, domain):
-    try:
-        r = requests.get(base_url, headers=HEADERS, timeout=10)
-        if r.status_code == 200:
-            html = r.text
-            m = re.search(r'<title[^>]*>(.*?)</title>', html, re.IGNORECASE | re.DOTALL)
-            if m:
-                title = m.group(1).strip()
-                title = re.split(r'\s*[|\-\u2013\u2014]\s*', title)[0].strip()
-                title = re.sub(r'&amp;', '&', title)
-                title = re.sub(r'&#\d+;', '', title).strip()
-                if title and 2 < len(title) < 80:
-                    return title
-            h = re.search(r'<h1[^>]*>(.*?)</h1>', html, re.IGNORECASE | re.DOTALL)
-            if h:
-                h1 = re.sub(r'<[^>]+>', '', h.group(1)).strip()
-                if h1 and 2 < len(h1) < 80:
-                    return h1
-    except:
-        pass
-    slug = path_key.split('/')[-1] if path_key else domain
-    return slug.replace('-', ' ').replace('_', ' ').title() if slug else domain
-
-def detect_product(url, product_map):
-    parsed = urlparse(url)
-    parts  = [p for p in parsed.path.strip('/').split('/') if p]
-    prefix = f"{parsed.scheme}://{parsed.netloc}/{'/'.join(parts[:-1])}/" if parts else \
-             f"{parsed.scheme}://{parsed.netloc}/"
-    return product_map.get(prefix, urlparse(url).netloc)
 
 # ─────────────────────────────────────────────────────
 # PAGE FETCHING
@@ -236,7 +131,6 @@ def extract_meta(html):
         "h2s"       : " | ".join(h2s)[:300] if h2s else "",
     }
 
-
 def extract_main_content(html):
     for tag in ["main", "article"]:
         pat = re.compile(r"<" + tag + r"[^>]*>(.*?)</" + tag + r">", re.DOTALL | re.IGNORECASE)
@@ -249,13 +143,13 @@ def extract_main_content(html):
     if m and len(m.group(1)) > 200:
         return m.group(1)
 
-    for id_val in ["content", "main", "main-content", "page-content", "article", "primary", "wrapper", "body-content"]:
+    for id_val in ["content", "main", "main-content", "page-content", "article", "primary"]:
         pat = re.compile(r'<(?:div|section)[^>]+id="' + id_val + r'"[^>]*>(.*?)</(?:div|section)>', re.DOTALL | re.IGNORECASE)
         m = pat.search(html)
         if m and len(m.group(1)) > 200:
             return m.group(1)
 
-    for cls_val in ["content", "main", "article", "entry-content", "post-content", "page-body", "main-body"]:
+    for cls_val in ["content", "main", "article", "entry-content", "post-content"]:
         pat = re.compile(r'<(?:div|section)[^>]+class="[^"]*' + cls_val + r'[^"]*"[^>]*>(.*?)</(?:div|section)>', re.DOTALL | re.IGNORECASE)
         m = pat.search(html)
         if m and len(m.group(1)) > 200:
@@ -263,15 +157,13 @@ def extract_main_content(html):
 
     return html
 
-
 def fetch_page(url):
     try:
         r = requests.get(url, headers=HEADERS, timeout=10)
         if r.status_code != 200:
             return None
         raw_html = r.text
-
-        meta = extract_meta(raw_html)
+        meta     = extract_meta(raw_html)
 
         html = raw_html
         for tag in ["script", "style", "nav", "footer", "header", "aside", "noscript", "iframe", "svg", "form"]:
@@ -279,8 +171,7 @@ def fetch_page(url):
 
         for noise in ["sidebar", "widget", "banner", "promo", "advertisement",
                       "breadcrumb", "pagination", "related", "social", "share",
-                      "cookie", "popup", "modal", "overlay", "newsletter",
-                      "contact-bar", "sticky", "floating", "phone-bar"]:
+                      "cookie", "popup", "modal", "overlay", "newsletter"]:
             pat = re.compile(
                 r'<(?:div|section|ul|span)[^>]+(?:class|id)="[^"]*' + noise + r'[^"]*"[^>]*>.*?</(?:div|section|ul|span)>',
                 re.DOTALL | re.IGNORECASE
@@ -307,7 +198,6 @@ def fetch_page(url):
 
         structured = "\n".join(parts)
         return structured if len(structured) > 100 else None
-
     except:
         return None
 
@@ -345,8 +235,6 @@ DESCRIPTION rules by page type:
 
 UNIVERSAL DESCRIPTION RULES:
 - FIRST SENTENCE must contain the single most distinctive, specific fact about this page.
-  Ask yourself: what would make an AI crawler choose THIS page over 10 similar ones?
-  Lead with that. It could be: a specific audience, a unique capability, a named tool, a version range, a concrete outcome.
 - Weave the audience in naturally: "IT administrators can...", "End users who need to...", "Developers integrating..."
 - Maximum 3 sentences. Every sentence must add new information — no repetition.
 - No comma-separated lists of more than 3 items.
@@ -354,51 +242,50 @@ UNIVERSAL DESCRIPTION RULES:
 - No nav links, sidebar content, phone numbers, or footer content.
 - Active voice, present tense.
 
-JSON FORMAT:
-- Double quotes only, no apostrophes in values
-- No trailing commas, no line breaks inside values
-- Return raw JSON only — no markdown, no explanation
-
-Return exactly:
+JSON FORMAT — double quotes only, no trailing commas, raw JSON only:
 {{"title": "...", "description": "..."}}
 
 URL: {url}
 Page content:
 {content}"""
 
-RESCORE_PROMPT = """You are evaluating an llms.txt description. These are read by AI crawlers — the goal is precision and distinctiveness, not marketing copy.
+RESCORE_PROMPT = """You are evaluating an llms.txt description. Score 1-5 on specificity and rewrite if needed.
 
-Score the description from 1 to 5:
 1 = Generic filler, comma-list dump, or starts with "This page / The page / A guide"
 2 = Vague — could describe any page in this category
 3 = Adequate — accurate but lacks the most distinctive fact
 4 = Good — specific, accurate, audience-aware
 5 = Excellent — leads with the most distinctive fact, audience clear, zero padding
 
-IF score <= 3: rewrite following these rules:
-- First sentence must lead with the single most distinctive, specific fact about this URL
-- Weave audience in naturally ("IT administrators can...", "End users who need to...")
-- Max 3 sentences, no comma lists of more than 3 items
-- No filler openers, no nav/sidebar content
-- Active voice, present tense
-
+IF score <= 3: rewrite — first sentence leads with the single most distinctive fact, audience woven in naturally, max 3 sentences, no filler openers, active voice, present tense.
 IF score >= 4: return description unchanged.
 
 URL: {url}
 Page content (first 1500 chars): {content}
 Current description: {description}
 
-Return ONLY JSON: {{"score": <1-5>, "description": "<final description>"}}
-No markdown, no explanation."""
+Return ONLY JSON: {{"score": <1-5>, "description": "<final description>"}}"""
+
+DIFFERENTIATE_PROMPT = """Two pages on the same site have descriptions that are too similar. Rewrite Page B's description to focus ONLY on what is unique to Page B.
+
+Max 3 sentences. Lead with the most distinctive fact about Page B. Active voice, present tense. No filler openers.
+
+Page A URL: {url_a}
+Page A description: {desc_a}
+
+Page B URL: {url_b}
+Page B content: {content_b}
+Page B current description: {desc_b}
+
+Return ONLY JSON: {{"description": "<rewritten description for Page B>"}}"""
 
 def summarize(url, content, api_key, progress_q=None):
     snippet = content[:3500].strip()
     if not snippet:
         return None
-    last_error = None
     for attempt in range(3):
         try:
-            raw    = call_llm(SUMMARIZE_PROMPT.format(url=url, content=snippet), api_key)
+            raw = call_llm(SUMMARIZE_PROMPT.format(url=url, content=snippet), api_key)
             if raw.startswith("```"):
                 raw = raw.split("```")[1]
                 if raw.startswith("json"):
@@ -407,31 +294,27 @@ def summarize(url, content, api_key, progress_q=None):
             if "title" in result and "description" in result:
                 return result
         except Exception as e:
-            last_error = str(e)
             if attempt < 2:
                 time.sleep(0.5)
-            else:
-                if progress_q:
-                    progress_q.put({"type": "stage", "msg": f"API error: {last_error[:120]}", "pct": 0})
+            elif progress_q:
+                progress_q.put({"type": "stage", "msg": f"API error: {str(e)[:120]}", "pct": 0})
     return None
 
 def rescore_and_fix(url, content, description, api_key):
-    snippet = content[:1500].strip()
     try:
-        raw = call_llm(RESCORE_PROMPT.format(url=url, content=snippet, description=description), api_key)
+        raw = call_llm(RESCORE_PROMPT.format(url=url, content=content[:1500], description=description), api_key)
         if raw.startswith("```"):
             raw = raw.split("```")[1]
             if raw.startswith("json"):
                 raw = raw[4:]
         result = json.loads(raw.strip())
-        score  = int(result.get("score", 3))
         desc   = result.get("description", description).strip()
-        return score, desc if desc else description
+        return int(result.get("score", 3)), desc if desc else description
     except:
         return 3, description
 
 # ─────────────────────────────────────────────────────
-# QUALITY CHECKING
+# QUALITY ASSURANCE
 # ─────────────────────────────────────────────────────
 FILLER_STARTERS = [
     "this page ", "the page ", "this guide ", "this tool ", "this api ",
@@ -442,8 +325,7 @@ FILLER_STARTERS = [
 ]
 
 def strip_filler_opener(desc):
-    d     = desc.strip()
-    lower = d.lower()
+    d, lower = desc.strip(), desc.strip().lower()
     for starter in FILLER_STARTERS:
         if lower.startswith(starter):
             remainder = d[len(starter):].strip()
@@ -453,125 +335,45 @@ def strip_filler_opener(desc):
 
 def score_description(desc):
     issues = []
-    d      = desc.strip()
-    words  = d.split()
-    lower  = d.lower()
-
+    d, lower = desc.strip(), desc.strip().lower()
     for starter in FILLER_STARTERS:
         if lower.startswith(starter):
-            issues.append("filler_opener")
-            break
-
+            issues.append("filler_opener"); break
     if len(d) < 60:
         issues.append("too_short")
-
     if re.match(r'^(to |for |by )', lower):
         issues.append("fragment")
-
-    if len(words) > 65:
+    if len(d.split()) > 65:
         issues.append("too_long")
-
-    sentences = [s.strip() for s in d.split('.') if s.strip()]
-    for sent in sentences:
+    for sent in [s.strip() for s in d.split('.') if s.strip()]:
         if sent.count(',') >= 4:
-            issues.append("comma_list")
-            break
-
+            issues.append("comma_list"); break
     if lower.rstrip().endswith('and more') or lower.rstrip().endswith('and more.'):
         issues.append("and_more_ending")
-
-    if "filler_opener" in issues or "too_short" in issues or "fragment" in issues:
-        score = 1
-    elif "too_long" in issues or "comma_list" in issues or "and_more_ending" in issues:
-        score = 2
-    else:
-        score = 4
-
-    return score, issues
-
-DIFFERENTIATE_PROMPT = """Two pages on the same website have descriptions that are too similar.
-An AI crawler cannot tell them apart. Rewrite the description for Page B so it focuses ONLY
-on what is unique to Page B — what Page A does NOT cover.
-
-Do not mention Page A. Just make Page B description distinctive on its own.
-Max 3 sentences. Lead with the most distinctive fact about Page B.
-Active voice, present tense. No filler openers.
-
-Page A URL: {url_a}
-Page A description: {desc_a}
-
-Page B URL: {url_b}
-Page B content: {content_b}
-Page B current description: {desc_b}
-
-Return ONLY JSON: {{"description": "<rewritten description for Page B>"}}
-No markdown, no explanation."""
+    if any(i in issues for i in ("filler_opener", "too_short", "fragment")):
+        return 1, issues
+    if any(i in issues for i in ("too_long", "comma_list", "and_more_ending")):
+        return 2, issues
+    return 4, issues
 
 def description_similarity(a, b):
     words_a = set(re.findall(r'\b\w{4,}\b', a.lower()))
     words_b = set(re.findall(r'\b\w{4,}\b', b.lower()))
     if not words_a or not words_b:
         return 0.0
-    overlap = len(words_a & words_b)
-    return overlap / min(len(words_a), len(words_b))
-
-def fix_sibling_duplicates(summaries, page_map, api_key, progress_q=None):
-    if progress_q:
-        progress_q.put({"type": "stage", "msg": "QA Phase 3 — Sibling differentiation", "pct": 94})
-
-    domain_groups = defaultdict(list)
-    for item in summaries:
-        domain = urlparse(item["url"]).netloc
-        domain_groups[domain].append(item)
-
-    fixed = 0
-    for domain, items in domain_groups.items():
-        if len(items) < 2:
-            continue
-        for i in range(len(items)):
-            for j in range(i + 1, len(items)):
-                a = items[i]
-                b = items[j]
-                sim = description_similarity(a["description"], b["description"])
-                if sim >= 0.70:
-                    content_b = page_map.get(b["url"], "")
-                    if not content_b:
-                        continue
-                    try:
-                        raw = call_llm(DIFFERENTIATE_PROMPT.format(
-                            url_a=a["url"], desc_a=a["description"],
-                            url_b=b["url"], content_b=content_b[:2000],
-                            desc_b=b["description"]
-                        ), api_key)
-                        if raw.startswith("```"):
-                            raw = raw.split("```")[1]
-                            if raw.startswith("json"):
-                                raw = raw[4:]
-                        result  = json.loads(raw.strip())
-                        new_desc = result.get("description", "").strip()
-                        if new_desc and len(new_desc) > 60:
-                            b["description"] = new_desc
-                            fixed += 1
-                    except:
-                        pass
-
-    if progress_q:
-        progress_q.put({"type": "qa_result", "fixed": fixed, "dups": 0})
-
-    return summaries
-
+    return len(words_a & words_b) / min(len(words_a), len(words_b))
 
 def fix_quality(summaries, page_map, api_key, progress_q=None):
     total = len(summaries)
 
+    # Phase 1 — structural fixes (no LLM)
     if progress_q:
         progress_q.put({"type": "stage", "msg": "QA Phase 1 — Structural fixes", "pct": 86})
 
     stripped = 0
     for item in summaries:
-        original = item["description"]
-        fixed    = strip_filler_opener(original)
-        if fixed != original:
+        fixed = strip_filler_opener(item["description"])
+        if fixed != item["description"]:
             item["description"] = fixed
             stripped += 1
 
@@ -579,57 +381,85 @@ def fix_quality(summaries, page_map, api_key, progress_q=None):
     dup_fixed   = 0
     for item in summaries:
         if title_count[item["title"]] > 1:
-            slug = item["url"].rstrip("/").split("/")[-1]
-            slug = re.sub(r'\.html?$', '', slug)
+            slug = re.sub(r'\.html?$', '', item["url"].rstrip("/").split("/")[-1])
             slug = slug.replace("-", " ").replace("_", " ").title()
             if slug:
                 item["title"] = slug
-                dup_fixed    += 1
+                dup_fixed += 1
 
     if progress_q:
         progress_q.put({"type": "qa_result", "fixed": stripped, "dups": dup_fixed})
 
+    # Phase 2 — LLM rescore low-quality entries
     if progress_q:
         progress_q.put({"type": "stage", "msg": "QA Phase 2 — LLM scoring & rewrite", "pct": 90})
 
     rescore_fixed = 0
     for i, item in enumerate(summaries):
-        score, issues = score_description(item["description"])
+        score, _ = score_description(item["description"])
         if score <= 3:
             content = page_map.get(item["url"], "")
             if content:
-                new_score, new_desc = rescore_and_fix(item["url"], content, item["description"], api_key)
+                _, new_desc = rescore_and_fix(item["url"], content, item["description"], api_key)
                 if new_desc != item["description"]:
                     item["description"] = new_desc
-                    rescore_fixed      += 1
+                    rescore_fixed += 1
             if progress_q and i % 5 == 0:
                 progress_q.put({"type": "qa_rescore", "current": i + 1, "total": total})
 
     if progress_q:
         progress_q.put({"type": "qa_result", "fixed": rescore_fixed, "dups": 0})
 
-    summaries = fix_sibling_duplicates(summaries, page_map, api_key, progress_q)
+    # Phase 3 — sibling deduplication
+    if progress_q:
+        progress_q.put({"type": "stage", "msg": "QA Phase 3 — Sibling differentiation", "pct": 94})
+
+    domain_groups = defaultdict(list)
+    for item in summaries:
+        domain_groups[urlparse(item["url"]).netloc].append(item)
+
+    dedup_fixed = 0
+    for items in domain_groups.values():
+        for i in range(len(items)):
+            for j in range(i + 1, len(items)):
+                if description_similarity(items[i]["description"], items[j]["description"]) >= 0.70:
+                    content_b = page_map.get(items[j]["url"], "")
+                    if not content_b:
+                        continue
+                    try:
+                        raw = call_llm(DIFFERENTIATE_PROMPT.format(
+                            url_a=items[i]["url"], desc_a=items[i]["description"],
+                            url_b=items[j]["url"], content_b=content_b[:2000],
+                            desc_b=items[j]["description"]
+                        ), api_key)
+                        if raw.startswith("```"):
+                            raw = raw.split("```")[1]
+                            if raw.startswith("json"):
+                                raw = raw[4:]
+                        new_desc = json.loads(raw.strip()).get("description", "").strip()
+                        if new_desc and len(new_desc) > 60:
+                            items[j]["description"] = new_desc
+                            dedup_fixed += 1
+                    except:
+                        pass
+
+    if progress_q:
+        progress_q.put({"type": "qa_result", "fixed": dedup_fixed, "dups": 0})
 
     return summaries
 
 # ─────────────────────────────────────────────────────
-# GENERATE llms.txt
+# OUTPUT
 # ─────────────────────────────────────────────────────
-def generate_llms_txt(summaries, product_map):
-    seen_urls = set()
-    deduped   = []
+def generate_llms_txt(summaries):
+    seen, lines = set(), []
     for item in summaries:
-        if item["url"] not in seen_urls:
-            seen_urls.add(item["url"])
-            deduped.append(item)
-
-    lines = []
-    for item in deduped:
-        lines.append(f"- Source: {item['url']}")
-        lines.append(f"  Title: {item['title']}")
-        lines.append(f"  Description: {item['description']}")
-        lines.append("")
-
+        if item["url"] not in seen:
+            seen.add(item["url"])
+            lines.append(f"- Source: {item['url']}")
+            lines.append(f"  Title: {item['title']}")
+            lines.append(f"  Description: {item['description']}")
+            lines.append("")
     return "\n".join(lines)
 
 # ─────────────────────────────────────────────────────
@@ -663,10 +493,7 @@ HTML = """<!DOCTYPE html>
       padding: 3px 12px; margin-bottom: 28px;
     }
     label { display: block; font-size: 13px; font-weight: 600; color: #333; margin-bottom: 7px; }
-
-    .api-key-row {
-      display: flex; gap: 8px; margin-bottom: 20px; align-items: flex-start;
-    }
+    .api-key-row { display: flex; gap: 8px; margin-bottom: 20px; align-items: flex-start; }
     .api-key-row input {
       flex: 1; padding: 11px 14px; border: 1.5px solid #e0e0e0;
       border-radius: 10px; font-size: 13px; color: #333; outline: none;
@@ -674,7 +501,6 @@ HTML = """<!DOCTYPE html>
     }
     .api-key-row input:focus { border-color: #6c47ff; }
     .api-key-note { font-size: 11px; color: #aaa; margin-top: 4px; }
-
     .tabs { display: flex; gap: 8px; margin-bottom: 16px; }
     .tab {
       flex: 1; padding: 9px 12px; border-radius: 8px; border: 1.5px solid #e0e0e0;
@@ -683,7 +509,6 @@ HTML = """<!DOCTYPE html>
     }
     .tab:hover { border-color: #6c47ff; color: #6c47ff; }
     .tab.active { background: #6c47ff; border-color: #6c47ff; color: #fff; }
-
     .upload-area {
       border: 2px dashed #d5d5d5; border-radius: 12px; padding: 28px;
       text-align: center; cursor: pointer; transition: all 0.2s;
@@ -697,7 +522,6 @@ HTML = """<!DOCTYPE html>
     .upload-text { font-size: 14px; color: #555; font-weight: 500; }
     .upload-hint { font-size: 12px; color: #aaa; margin-top: 4px; }
     .file-name { font-size: 13px; color: #6c47ff; font-weight: 600; margin-top: 8px; }
-
     .sitemap-input {
       width: 100%; padding: 12px 14px; border: 1.5px solid #e0e0e0;
       border-radius: 10px; font-size: 14px; outline: none; margin-bottom: 20px;
@@ -705,7 +529,6 @@ HTML = """<!DOCTYPE html>
     }
     .sitemap-input:focus { border-color: #6c47ff; }
     .sitemap-hint { font-size: 11px; color: #aaa; margin-top: -16px; margin-bottom: 20px; }
-
     #submitBtn {
       width: 100%; padding: 14px; background: #6c47ff; color: #fff;
       border: none; border-radius: 10px; font-size: 15px; font-weight: 700;
@@ -713,7 +536,6 @@ HTML = """<!DOCTYPE html>
     }
     #submitBtn:hover:not(:disabled) { background: #5735e0; }
     #submitBtn:disabled { background: #b0a0f0; cursor: not-allowed; }
-
     #progressPanel { display: none; margin-top: 32px; }
     .stages {
       display: flex; margin-bottom: 24px;
@@ -728,7 +550,6 @@ HTML = """<!DOCTYPE html>
     .step-icon { font-size: 15px; display: block; margin-bottom: 3px; }
     .stage-step.active { background: #6c47ff; color: #fff; }
     .stage-step.done   { background: #ecfdf5; color: #065f46; }
-
     .progress-wrap { margin-bottom: 20px; }
     .progress-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
     .progress-label { font-size: 13px; font-weight: 700; color: #333; display: flex; align-items: center; gap: 8px; }
@@ -744,7 +565,6 @@ HTML = """<!DOCTYPE html>
     }
     .progress-sub { font-size: 11px; color: #999; margin-top: 5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     @keyframes spin { to { transform: rotate(360deg); } }
-
     .log-wrap { border: 1px solid #e5e7eb; border-radius: 10px; overflow: hidden; }
     .log-header { background: #1e1e2e; padding: 8px 14px; font-size: 11px; font-weight: 700; color: #6c47ff; letter-spacing: 0.5px; }
     .log-area { background: #1e1e2e; padding: 12px 14px; max-height: 200px; overflow-y: auto; }
@@ -755,7 +575,6 @@ HTML = """<!DOCTYPE html>
     .log-line.stage   { color: #60cdff; font-weight: bold; }
     .log-line.error   { color: #f87171; }
     .log-line.qa      { color: #c084fc; }
-
     .result-box {
       display: none; margin-top: 20px; padding: 18px 20px;
       background: #f0fdf4; border: 1.5px solid #6ee7b7;
@@ -776,12 +595,10 @@ HTML = """<!DOCTYPE html>
       border-radius: 10px; font-size: 13px; color: #991b1b;
     }
     .error-box.show { display: block; }
-
     .login-card {
       background: #fff; border-radius: 20px;
       box-shadow: 0 4px 32px rgba(0,0,0,0.09);
-      padding: 48px; width: 100%; max-width: 380px;
-      text-align: center;
+      padding: 48px; width: 100%; max-width: 380px; text-align: center;
     }
     .login-card h2 { font-size: 20px; color: #1a1a2e; margin-bottom: 8px; }
     .login-card p  { color: #777; font-size: 13px; margin-bottom: 24px; }
@@ -822,7 +639,6 @@ HTML = """<!DOCTYPE html>
   <div class="badge">⚡ GPT-4o-mini · Works on any website · Zero setup</div>
 
   <form id="genForm">
-
     {% if not server_has_key %}
     <label>OpenAI API Key</label>
     <div class="api-key-row">
@@ -845,7 +661,7 @@ HTML = """<!DOCTYPE html>
         <input type="file" id="csv_file" accept=".csv">
         <div class="upload-icon">📄</div>
         <div class="upload-text">Click to upload or drag & drop</div>
-        <div class="upload-hint">One URL per row · products auto-detected</div>
+        <div class="upload-hint">One URL per row</div>
         <div class="file-name" id="fileName"></div>
       </div>
     </div>
@@ -860,7 +676,7 @@ HTML = """<!DOCTYPE html>
         <input type="file" id="sitemap_file" accept=".xml">
         <div class="upload-icon">🗺</div>
         <div class="upload-text">Click to upload sitemap.xml</div>
-        <div class="upload-hint">Local file · sitemap index supported</div>
+        <div class="upload-hint">Sitemap index supported</div>
         <div class="file-name" id="fileNameXml"></div>
       </div>
     </div>
@@ -978,7 +794,6 @@ HTML = """<!DOCTYPE html>
     const apiKeyInput = document.getElementById('api_key')
     const apiKey = apiKeyInput ? apiKeyInput.value.trim() : ''
     if (apiKeyInput && !apiKey) { showError('Please enter your OpenAI API key'); return }
-
     if (activeTab === 'csv' && !document.getElementById('csv_file').files[0]) {
       showError('Please upload a CSV file'); return
     }
@@ -996,8 +811,7 @@ HTML = """<!DOCTYPE html>
     document.getElementById('spinner').style.display    = ''
     resultBlob = null
 
-    btn.disabled    = true
-    btn.textContent = 'Processing...'
+    btn.disabled = true; btn.textContent = 'Processing...'
     panel.style.display = 'block'
     panel.scrollIntoView({ behavior: 'smooth', block: 'start' })
 
@@ -1022,8 +836,7 @@ HTML = """<!DOCTYPE html>
       btn.disabled = false; btn.textContent = 'Generate llms.txt'; return
     }
 
-    let evtSource = null
-    let sseRetries = 0
+    let evtSource = null, sseRetries = 0
     const MAX_RETRIES = 20
 
     function connectSSE() {
@@ -1086,7 +899,7 @@ HTML = """<!DOCTYPE html>
           addLog(`↻ Connection dropped — reconnecting (${sseRetries}/${MAX_RETRIES})...`, 'stage')
           setTimeout(connectSSE, 2000 * sseRetries)
         } else {
-          showError('Connection lost after multiple retries. The job may still be running — try refreshing and checking /download/' + jobId)
+          showError('Connection lost. Job may still be running — check /download/' + jobId)
         }
       }
     }
@@ -1118,8 +931,7 @@ def login():
     if request.method == "POST":
         if request.form.get("password") == APP_PASSWORD:
             session["authenticated"] = True
-            return jsonify({"ok": True}) if request.is_json else \
-                   __import__('flask').redirect("/")
+            return __import__('flask').redirect("/")
         error = True
     return render_template_string(HTML, needs_login=True, login_error=error, server_has_key=bool(OPENAI_API_KEY))
 
@@ -1152,10 +964,8 @@ def start():
     if input_mode == "csv":
         if "csv_file" not in request.files:
             return jsonify({"error": "No CSV file uploaded"}), 400
-        file   = request.files["csv_file"]
-        stream = io.StringIO(file.stream.read().decode("utf-8"))
-        reader = csv.reader(stream)
-        urls_raw = [cell.strip() for row in reader for cell in row if cell.strip().startswith("http")]
+        stream   = io.StringIO(request.files["csv_file"].stream.read().decode("utf-8"))
+        urls_raw = [cell.strip() for row in csv.reader(stream) for cell in row if cell.strip().startswith("http")]
 
     elif input_mode == "sitemap":
         sitemap_url = request.form.get("sitemap_url", "").strip()
@@ -1172,10 +982,8 @@ def start():
         if err:
             return jsonify({"error": f"Sitemap parse error: {err}"}), 400
 
-    urls_cleaned = [clean_url(u) for u in urls_raw]
-    seen         = set()
-    urls         = [u for u in urls_cleaned if not (u in seen or seen.add(u))]
-
+    seen = set()
+    urls = [u for u in (clean_url(u) for u in urls_raw) if not (u in seen or seen.add(u))]
     if not urls:
         return jsonify({"error": "No valid URLs found"}), 400
 
@@ -1186,18 +994,10 @@ def start():
     def run_pipeline():
         try:
             total = len(urls)
-            q.put({"type": "stage", "msg": f"{total} unique URLs loaded", "pct": 2})
+            q.put({"type": "stage", "msg": f"{total} URLs loaded", "pct": 2})
 
-            q.put({"type": "stage", "msg": "Detecting products from URLs...", "pct": 3})
-            product_map    = build_product_map(urls)
-            if not product_map:
-                parsed      = urlparse(urls[0])
-                base_url    = f"{parsed.scheme}://{parsed.netloc}/"
-                product_map = {base_url: parsed.netloc}
-            products_found = list(dict.fromkeys(product_map.values()))
-            q.put({"type": "stage", "msg": f"Products: {', '.join(products_found)}", "pct": 4})
-
-            q.put({"type": "stage", "msg": "Web Fetching", "pct": 5})
+            # Fetch
+            q.put({"type": "stage", "msg": "Fetching pages", "pct": 5})
             pages = []
             for i, url in enumerate(urls, 1):
                 content = fetch_page(url)
@@ -1208,51 +1008,38 @@ def start():
                 time.sleep(0.1)
 
             if not pages:
-                q.put({"type": "error", "msg": "Could not fetch any pages"})
-                return
+                q.put({"type": "error", "msg": "Could not fetch any pages"}); return
 
             page_map = {p["url"]: p["content"] for p in pages}
-            fetched  = len(pages)
 
+            # Summarize
             q.put({"type": "stage", "msg": "Summarising with GPT-4o-mini", "pct": 33})
-            summaries    = []
-            failed_pages = []
+            summaries, failed = [], []
             for i, page in enumerate(pages, 1):
                 result = summarize(page["url"], page["content"], api_key, q)
-                ok     = result is not None
-                if ok:
-                    summaries.append({
-                        "url"        : page["url"],
-                        "title"      : result.get("title", ""),
-                        "description": result.get("description", ""),
-                        "product"    : detect_product(page["url"], product_map)
-                    })
+                if result:
+                    summaries.append({"url": page["url"], "title": result.get("title", ""), "description": result.get("description", "")})
                 else:
-                    failed_pages.append(page)
-                q.put({"type": "summarize", "current": i, "total": fetched, "url": page["url"], "ok": ok})
+                    failed.append(page)
+                q.put({"type": "summarize", "current": i, "total": len(pages), "url": page["url"], "ok": result is not None})
 
-            if failed_pages:
-                q.put({"type": "stage", "msg": f"Retrying {len(failed_pages)} failed pages", "pct": 80})
-                for page in failed_pages:
+            if failed:
+                q.put({"type": "stage", "msg": f"Retrying {len(failed)} failed pages", "pct": 80})
+                for page in failed:
                     result = summarize(page["url"], page["content"], api_key, q)
                     if result:
-                        summaries.append({
-                            "url"        : page["url"],
-                            "title"      : result.get("title", ""),
-                            "description": result.get("description", ""),
-                            "product"    : detect_product(page["url"], product_map)
-                        })
+                        summaries.append({"url": page["url"], "title": result.get("title", ""), "description": result.get("description", "")})
 
             if not summaries:
-                q.put({"type": "error", "msg": "Could not summarize any pages"})
-                return
+                q.put({"type": "error", "msg": "Could not summarize any pages"}); return
 
+            # QA
             q.put({"type": "stage", "msg": "Quality Assurance & Auto-fix", "pct": 85})
             summaries = fix_quality(summaries, page_map, api_key, q)
 
+            # Generate
             q.put({"type": "stage", "msg": "Generating llms.txt", "pct": 97})
-            output = generate_llms_txt(summaries, product_map)
-            jobs[job_id]["result"] = output.encode("utf-8")
+            jobs[job_id]["result"] = generate_llms_txt(summaries).encode("utf-8")
             q.put({"type": "done", "total": len(set(s["url"] for s in summaries))})
 
         except Exception as ex:
