@@ -250,7 +250,7 @@ RESCORE_PROMPT = """You are evaluating an llms.txt description. Score 1-5 on spe
 4 = Good — specific, accurate, audience-aware
 5 = Excellent — leads with the most distinctive fact, audience clear, zero padding
 
-IF score <= 2: rewrite — first sentence leads with the single most distinctive fact, audience woven in naturally, max 3 sentences, no filler openers, active voice, present tense.
+IF score <= 3: rewrite — first sentence leads with the single most distinctive fact, audience woven in naturally, max 3 sentences, no filler openers, active voice, present tense.
 IF score >= 3: return description unchanged.
 
 URL: {url}
@@ -388,7 +388,7 @@ def fix_quality(summaries, page_map, progress_q=None):
     rescore_fixed = 0
     for i, item in enumerate(summaries):
         score, _ = score_description(item["description"])
-        if score <= 2:
+        if score <= 3:
             content = page_map.get(item["url"], "")
             if content:
                 _, new_desc = rescore_and_fix(item["url"], content, item["description"])
