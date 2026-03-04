@@ -2,31 +2,38 @@ import csv
 import re
 import json
 import time
+import os
 import requests
-import ollama
 import io
 import threading
 import queue
-from flask import Flask, request, render_template_string, send_file, jsonify, Response, stream_with_context
+from flask import Flask, request, render_template_string, send_file, jsonify, Response, stream_with_context, session
 from collections import Counter, defaultdict
 from urllib.parse import urlparse, urlunparse
+from openai import OpenAI
 
 app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY", "llms-txt-secret-2024")
 app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024
 
-MODEL   = "mistral"
-HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; llms-txt-generator/1.0)"}
-jobs    = {}
+APP_PASSWORD   = os.environ.get("APP_PASSWORD", "")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+MODEL          = "gpt-4o-mini"
+HEADERS        = {"User-Agent": "Mozilla/5.0 (compatible; llms-txt-generator/1.0)"}
+jobs           = {}
 
 # ─────────────────────────────────────────────────────
 # LLM
 # ─────────────────────────────────────────────────────
-def call_llm(prompt):
-    response = ollama.chat(
+def call_llm(prompt, api_key):
+    client = OpenAI(api_key=api_key)
+    response = client.chat.completions.create(
         model=MODEL,
-        messages=[{"role": "user", "content": prompt}]
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2,
+        max_tokens=600,
     )
-    return response["message"]["content"].strip()
+    return response.choices[0].message.content.strip()
 
 # ─────────────────────────────────────────────────────
 # URL UTILITIES
@@ -250,8 +257,8 @@ RESCORE_PROMPT = """You are evaluating an llms.txt description. Score 1-5 on spe
 4 = Good — specific, accurate, audience-aware
 5 = Excellent — leads with the most distinctive fact, audience clear, zero padding
 
-IF score <= 2: rewrite — first sentence leads with the single most distinctive fact, audience woven in naturally, max 3 sentences, no filler openers, active voice, present tense.
-IF score >= 3: return description unchanged.
+IF score <= 3: rewrite — first sentence leads with the single most distinctive fact, audience woven in naturally, max 3 sentences, no filler openers, active voice, present tense.
+IF score >= 4: return description unchanged.
 
 URL: {url}
 Page content (first 1500 chars): {content}
@@ -272,13 +279,13 @@ Page B current description: {desc_b}
 
 Return ONLY JSON: {{"description": "<rewritten description for Page B>"}}"""
 
-def summarize(url, content):
+def summarize(url, content, api_key, progress_q=None):
     snippet = content[:3500].strip()
     if not snippet:
         return None
     for attempt in range(3):
         try:
-            raw = call_llm(SUMMARIZE_PROMPT.format(url=url, content=snippet))
+            raw = call_llm(SUMMARIZE_PROMPT.format(url=url, content=snippet), api_key)
             if raw.startswith("```"):
                 raw = raw.split("```")[1]
                 if raw.startswith("json"):
@@ -286,14 +293,16 @@ def summarize(url, content):
             result = json.loads(raw.strip())
             if "title" in result and "description" in result:
                 return result
-        except:
+        except Exception as e:
             if attempt < 2:
                 time.sleep(0.5)
+            elif progress_q:
+                progress_q.put({"type": "stage", "msg": f"API error: {str(e)[:120]}", "pct": 0})
     return None
 
-def rescore_and_fix(url, content, description):
+def rescore_and_fix(url, content, description, api_key):
     try:
-        raw = call_llm(RESCORE_PROMPT.format(url=url, content=content[:1500], description=description))
+        raw = call_llm(RESCORE_PROMPT.format(url=url, content=content[:1500], description=description), api_key)
         if raw.startswith("```"):
             raw = raw.split("```")[1]
             if raw.startswith("json"):
@@ -354,7 +363,7 @@ def description_similarity(a, b):
         return 0.0
     return len(words_a & words_b) / min(len(words_a), len(words_b))
 
-def fix_quality(summaries, page_map, progress_q=None):
+def fix_quality(summaries, page_map, api_key, progress_q=None):
     total = len(summaries)
 
     # Phase 1 — structural fixes (no LLM)
@@ -388,10 +397,10 @@ def fix_quality(summaries, page_map, progress_q=None):
     rescore_fixed = 0
     for i, item in enumerate(summaries):
         score, _ = score_description(item["description"])
-        if score <= 2:
+        if score <= 3:
             content = page_map.get(item["url"], "")
             if content:
-                _, new_desc = rescore_and_fix(item["url"], content, item["description"])
+                _, new_desc = rescore_and_fix(item["url"], content, item["description"], api_key)
                 if new_desc != item["description"]:
                     item["description"] = new_desc
                     rescore_fixed += 1
@@ -422,7 +431,7 @@ def fix_quality(summaries, page_map, progress_q=None):
                             url_a=items[i]["url"], desc_a=items[i]["description"],
                             url_b=items[j]["url"], content_b=content_b[:2000],
                             desc_b=items[j]["description"]
-                        ))
+                        ), api_key)
                         if raw.startswith("```"):
                             raw = raw.split("```")[1]
                             if raw.startswith("json"):
@@ -484,6 +493,14 @@ HTML = """<!DOCTYPE html>
       padding: 3px 12px; margin-bottom: 28px;
     }
     label { display: block; font-size: 13px; font-weight: 600; color: #333; margin-bottom: 7px; }
+    .api-key-row { display: flex; gap: 8px; margin-bottom: 20px; align-items: flex-start; }
+    .api-key-row input {
+      flex: 1; padding: 11px 14px; border: 1.5px solid #e0e0e0;
+      border-radius: 10px; font-size: 13px; color: #333; outline: none;
+      font-family: monospace; transition: border-color 0.2s;
+    }
+    .api-key-row input:focus { border-color: #6c47ff; }
+    .api-key-note { font-size: 11px; color: #aaa; margin-top: 4px; }
     .tabs { display: flex; gap: 8px; margin-bottom: 16px; }
     .tab {
       flex: 1; padding: 9px 12px; border-radius: 8px; border: 1.5px solid #e0e0e0;
@@ -578,15 +595,60 @@ HTML = """<!DOCTYPE html>
       border-radius: 10px; font-size: 13px; color: #991b1b;
     }
     .error-box.show { display: block; }
+    .login-card {
+      background: #fff; border-radius: 20px;
+      box-shadow: 0 4px 32px rgba(0,0,0,0.09);
+      padding: 48px; width: 100%; max-width: 380px; text-align: center;
+    }
+    .login-card h2 { font-size: 20px; color: #1a1a2e; margin-bottom: 8px; }
+    .login-card p  { color: #777; font-size: 13px; margin-bottom: 24px; }
+    .login-input {
+      width: 100%; padding: 12px 14px; border: 1.5px solid #e0e0e0;
+      border-radius: 10px; font-size: 14px; outline: none; margin-bottom: 12px;
+      transition: border-color 0.2s; text-align: center; letter-spacing: 2px;
+    }
+    .login-input:focus { border-color: #6c47ff; }
+    .login-btn {
+      width: 100%; padding: 13px; background: #6c47ff; color: #fff;
+      border: none; border-radius: 10px; font-size: 14px; font-weight: 700;
+      cursor: pointer; transition: background 0.2s;
+    }
+    .login-btn:hover { background: #5735e0; }
+    .login-error { color: #dc2626; font-size: 12px; margin-top: 8px; }
   </style>
 </head>
 <body>
+
+{% if needs_login %}
+<div class="login-card">
+  <div style="font-size:32px;margin-bottom:12px">🔐</div>
+  <h2>llms<span style="color:#6c47ff">.txt</span> Generator</h2>
+  <p>Enter the app password to continue</p>
+  <form method="POST" action="/login">
+    <input class="login-input" type="password" name="password" placeholder="Password" autofocus>
+    {% if login_error %}<div class="login-error">Incorrect password</div>{% endif %}
+    <br><br>
+    <button class="login-btn" type="submit">Unlock</button>
+  </form>
+</div>
+
+{% else %}
 <div class="card">
   <div class="logo">llms<span>.txt</span> Generator</div>
   <div class="subtitle">Upload a CSV or sitemap → get a production-ready llms.txt instantly</div>
-  <div class="badge">⚡ Mistral · Runs Locally · Zero Cost</div>
+  <div class="badge">⚡ GPT-4o-mini · Works on any website · Zero setup</div>
 
   <form id="genForm">
+    {% if not server_has_key %}
+    <label>OpenAI API Key</label>
+    <div class="api-key-row">
+      <div style="flex:1">
+        <input type="password" id="api_key" placeholder="sk-..." autocomplete="off">
+        <div class="api-key-note">Your key is sent directly to OpenAI and never stored</div>
+      </div>
+    </div>
+    {% endif %}
+
     <label>Input</label>
     <div class="tabs">
       <button type="button" class="tab active" onclick="switchTab(this,'csv')">📄 CSV Upload</button>
@@ -651,6 +713,7 @@ HTML = """<!DOCTYPE html>
     <div class="error-box" id="errorBox"></div>
   </div>
 </div>
+{% endif %}
 
 <script>
   let resultBlob = null
@@ -728,6 +791,9 @@ HTML = """<!DOCTYPE html>
     const btn   = document.getElementById('submitBtn')
     const panel = document.getElementById('progressPanel')
 
+    const apiKeyInput = document.getElementById('api_key')
+    const apiKey = apiKeyInput ? apiKeyInput.value.trim() : ''
+    if (apiKeyInput && !apiKey) { showError('Please enter your OpenAI API key'); return }
     if (activeTab === 'csv' && !document.getElementById('csv_file').files[0]) {
       showError('Please upload a CSV file'); return
     }
@@ -755,6 +821,7 @@ HTML = """<!DOCTYPE html>
 
     const formData = new FormData()
     formData.set('input_mode', activeTab)
+    if (apiKey) formData.set('api_key', apiKey)
     if (activeTab === 'csv')         formData.set('csv_file', document.getElementById('csv_file').files[0])
     if (activeTab === 'sitemap')     formData.set('sitemap_url', document.getElementById('sitemap_url').value.trim())
     if (activeTab === 'sitemapfile') formData.set('sitemap_file', document.getElementById('sitemap_file').files[0])
@@ -769,56 +836,74 @@ HTML = """<!DOCTYPE html>
       btn.disabled = false; btn.textContent = 'Generate llms.txt'; return
     }
 
-    const evtSource = new EventSource('/progress/' + jobId)
-    evtSource.onmessage = function(e) {
-      const d = JSON.parse(e.data)
-      if (d.type === 'ping') return
+    let evtSource = null, sseRetries = 0
+    const MAX_RETRIES = 20
 
-      if (d.type === 'stage') {
-        addLog('▶ ' + d.msg, 'stage')
-        setProgress(d.msg, d.pct || 0)
-        if (d.msg.toLowerCase().includes('fetch'))   setStage('fetch')
-        if (d.msg.toLowerCase().includes('summari')) setStage('summarize')
-        if (d.msg.toLowerCase().includes('qa') || d.msg.toLowerCase().includes('quality')) setStage('qa')
-        if (d.msg.toLowerCase().includes('generat')) setStage('generate')
+    function connectSSE() {
+      if (evtSource) evtSource.close()
+      evtSource = new EventSource('/progress/' + jobId)
+      evtSource.onmessage = function(e) {
+        const d = JSON.parse(e.data)
+        if (d.type === 'ping') return
 
-      } else if (d.type === 'fetch') {
-        setProgress('Fetching pages', Math.round((d.current/d.total)*28)+4, `${d.current} / ${d.total}`, d.url)
-        addLog(`${d.ok?'✓':'✗'} [${d.current}/${d.total}] ${d.url}`, d.ok?'success':'warning')
+        if (d.type === 'stage') {
+          addLog('▶ ' + d.msg, 'stage')
+          setProgress(d.msg, d.pct || 0)
+          if (d.msg.toLowerCase().includes('fetch'))   setStage('fetch')
+          if (d.msg.toLowerCase().includes('summari')) setStage('summarize')
+          if (d.msg.toLowerCase().includes('qa') || d.msg.toLowerCase().includes('quality')) setStage('qa')
+          if (d.msg.toLowerCase().includes('generat')) setStage('generate')
 
-      } else if (d.type === 'summarize') {
-        setProgress('Summarising with Mistral', Math.round((d.current/d.total)*46)+33, `${d.current} / ${d.total}`, d.url)
-        addLog(`${d.ok?'✓':'✗'} [${d.current}/${d.total}] ${d.url}`, d.ok?'success':'warning')
+        } else if (d.type === 'fetch') {
+          setProgress('Fetching pages', Math.round((d.current/d.total)*28)+4, `${d.current} / ${d.total}`, d.url)
+          addLog(`${d.ok?'✓':'✗'} [${d.current}/${d.total}] ${d.url}`, d.ok?'success':'warning')
 
-      } else if (d.type === 'qa_result') {
-        if (d.fixed > 0 || d.dups > 0) addLog(`  ↳ Fixed ${d.fixed} descriptions · ${d.dups} duplicate titles resolved`, 'qa')
+        } else if (d.type === 'summarize') {
+          setProgress('Summarising with GPT-4o-mini', Math.round((d.current/d.total)*46)+33, `${d.current} / ${d.total}`, d.url)
+          addLog(`${d.ok?'✓':'✗'} [${d.current}/${d.total}] ${d.url}`, d.ok?'success':'warning')
 
-      } else if (d.type === 'qa_rescore') {
-        setProgress('LLM Scoring & Rewriting', 90 + Math.round((d.current/d.total)*7), `${d.current} / ${d.total}`)
+        } else if (d.type === 'qa_result') {
+          if (d.fixed > 0 || d.dups > 0) addLog(`  ↳ Fixed ${d.fixed} descriptions · ${d.dups} duplicate titles resolved`, 'qa')
 
-      } else if (d.type === 'done') {
+        } else if (d.type === 'qa_rescore') {
+          setProgress('LLM Scoring & Rewriting', 90 + Math.round((d.current/d.total)*7), `${d.current} / ${d.total}`)
+
+        } else if (d.type === 'done') {
+          sseRetries = MAX_RETRIES
+          evtSource.close()
+          STAGES.forEach(s => {
+            const el = document.getElementById('step-' + s)
+            if (el) { el.classList.remove('active'); el.classList.add('done') }
+          })
+          setProgress('Complete!', 100, `${d.total} entries`)
+          addLog(`✅ Done — ${d.total} entries generated`, 'success')
+          document.getElementById('spinner').style.display = 'none'
+          fetch('/download/' + jobId).then(r => r.blob()).then(blob => {
+            resultBlob = blob
+            document.getElementById('resultSub').textContent = `${d.total} pages summarized · ready to deploy`
+            document.getElementById('resultBox').classList.add('show')
+          })
+          btn.disabled = false; btn.textContent = 'Generate llms.txt'
+
+        } else if (d.type === 'error') {
+          sseRetries = MAX_RETRIES
+          evtSource.close()
+          showError(d.msg)
+          btn.disabled = false; btn.textContent = 'Generate llms.txt'
+        }
+      }
+      evtSource.onerror = function() {
         evtSource.close()
-        STAGES.forEach(s => {
-          const el = document.getElementById('step-' + s)
-          if (el) { el.classList.remove('active'); el.classList.add('done') }
-        })
-        setProgress('Complete!', 100, `${d.total} entries`)
-        addLog(`✅ Done — ${d.total} entries generated`, 'success')
-        document.getElementById('spinner').style.display = 'none'
-        fetch('/download/' + jobId).then(r => r.blob()).then(blob => {
-          resultBlob = blob
-          document.getElementById('resultSub').textContent = `${d.total} pages summarized · ready to deploy`
-          document.getElementById('resultBox').classList.add('show')
-        })
-        btn.disabled = false; btn.textContent = 'Generate llms.txt'
-
-      } else if (d.type === 'error') {
-        evtSource.close()
-        showError(d.msg)
-        btn.disabled = false; btn.textContent = 'Generate llms.txt'
+        if (sseRetries < MAX_RETRIES) {
+          sseRetries++
+          addLog(`↻ Connection dropped — reconnecting (${sseRetries}/${MAX_RETRIES})...`, 'stage')
+          setTimeout(connectSSE, 2000 * sseRetries)
+        } else {
+          showError('Connection lost. Job may still be running — check /download/' + jobId)
+        }
       }
     }
-    evtSource.onerror = () => evtSource.close()
+    connectSSE()
   })
 
   document.getElementById('downloadBtn')?.addEventListener('click', function() {
@@ -833,21 +918,53 @@ HTML = """<!DOCTYPE html>
 </html>"""
 
 # ─────────────────────────────────────────────────────
+# AUTH
+# ─────────────────────────────────────────────────────
+def is_authenticated():
+    if not APP_PASSWORD:
+        return True
+    return session.get("authenticated") is True
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    error = False
+    if request.method == "POST":
+        if request.form.get("password") == APP_PASSWORD:
+            session["authenticated"] = True
+            return __import__('flask').redirect("/")
+        error = True
+    return render_template_string(HTML, needs_login=True, login_error=error, server_has_key=bool(OPENAI_API_KEY))
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return __import__('flask').redirect("/")
+
+# ─────────────────────────────────────────────────────
 # ROUTES
 # ─────────────────────────────────────────────────────
 @app.route("/")
 def index():
-    return render_template_string(HTML)
+    if not is_authenticated():
+        return render_template_string(HTML, needs_login=True, login_error=False, server_has_key=bool(OPENAI_API_KEY))
+    return render_template_string(HTML, needs_login=False, login_error=False, server_has_key=bool(OPENAI_API_KEY))
 
 @app.route("/start", methods=["POST"])
 def start():
+    if not is_authenticated():
+        return jsonify({"error": "Not authenticated"}), 401
+
+    api_key = request.form.get("api_key", "").strip() or OPENAI_API_KEY
+    if not api_key:
+        return jsonify({"error": "No OpenAI API key provided"}), 400
+
     input_mode = request.form.get("input_mode", "csv")
     urls_raw   = []
 
     if input_mode == "csv":
         if "csv_file" not in request.files:
             return jsonify({"error": "No CSV file uploaded"}), 400
-        stream   = io.StringIO(request.files["csv_file"].stream.read().decode("utf-8"))
+        stream   = io.StringIO(request.files["csv_file"].stream.read().decode("utf-8-sig"))
         urls_raw = [cell.strip() for row in csv.reader(stream) for cell in row if cell.strip().startswith("http")]
 
     elif input_mode == "sitemap":
@@ -888,7 +1005,7 @@ def start():
                 if ok:
                     pages.append({"url": url, "content": content})
                 q.put({"type": "fetch", "current": i, "total": total, "url": url, "ok": ok})
-                time.sleep(0.2)
+                time.sleep(0.1)
 
             if not pages:
                 q.put({"type": "error", "msg": "Could not fetch any pages"}); return
@@ -896,10 +1013,10 @@ def start():
             page_map = {p["url"]: p["content"] for p in pages}
 
             # Summarize
-            q.put({"type": "stage", "msg": "Summarising with Mistral", "pct": 33})
+            q.put({"type": "stage", "msg": "Summarising with GPT-4o-mini", "pct": 33})
             summaries, failed = [], []
             for i, page in enumerate(pages, 1):
-                result = summarize(page["url"], page["content"])
+                result = summarize(page["url"], page["content"], api_key, q)
                 if result:
                     summaries.append({"url": page["url"], "title": result.get("title", ""), "description": result.get("description", "")})
                 else:
@@ -909,7 +1026,7 @@ def start():
             if failed:
                 q.put({"type": "stage", "msg": f"Retrying {len(failed)} failed pages", "pct": 80})
                 for page in failed:
-                    result = summarize(page["url"], page["content"])
+                    result = summarize(page["url"], page["content"], api_key, q)
                     if result:
                         summaries.append({"url": page["url"], "title": result.get("title", ""), "description": result.get("description", "")})
 
@@ -918,7 +1035,7 @@ def start():
 
             # QA
             q.put({"type": "stage", "msg": "Quality Assurance & Auto-fix", "pct": 85})
-            summaries = fix_quality(summaries, page_map, q)
+            summaries = fix_quality(summaries, page_map, api_key, q)
 
             # Generate
             q.put({"type": "stage", "msg": "Generating llms.txt", "pct": 97})
@@ -943,7 +1060,7 @@ def progress(job_id):
         q   = job["queue"]
         while True:
             try:
-                msg = q.get(timeout=60)
+                msg = q.get(timeout=15)
                 yield f"data: {json.dumps(msg)}\n\n"
                 if msg["type"] in ("done", "error"):
                     break
@@ -967,6 +1084,8 @@ def download(job_id):
     return send_file(buf, mimetype="text/plain", as_attachment=True, download_name="llms.txt")
 
 if __name__ == "__main__":
-    print("\n✅ llms.txt Generator running!")
-    print("👉 Open: http://localhost:5000\n")
-    app.run(host="127.0.0.1", port=5000, debug=False, threaded=True)
+    port = int(os.environ.get("PORT", 5000))
+    print(f"\n✅ llms.txt Generator running on port {port}")
+    print(f"   APP_PASSWORD set: {'yes' if APP_PASSWORD else 'no (open access)'}")
+    print(f"   OPENAI_API_KEY set: {'yes' if OPENAI_API_KEY else 'no (users must provide key)'}\n")
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
