@@ -2,22 +2,45 @@ import csv
 import re
 import json
 import time
+import os
 import requests
-import ollama
 import io
 import threading
 import queue
-from flask import Flask, request, render_template_string, send_file, jsonify, Response, stream_with_context
+from flask import Flask, request, render_template_string, send_file, jsonify, Response, stream_with_context, session
 from collections import Counter, defaultdict
 from datetime import datetime
 from urllib.parse import urlparse, urlunparse
+from openai import OpenAI
 
 app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY", "llms-txt-secret-2024")
 app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024
 
-MODEL        = "mistral"
-HEADERS      = {"User-Agent": "Mozilla/5.0 (compatible; llms-txt-generator/1.0)"}
-jobs         = {}
+# ── Config from environment ──
+APP_PASSWORD    = os.environ.get("APP_PASSWORD", "")          # If set, require login
+OPENAI_API_KEY  = os.environ.get("OPENAI_API_KEY", "")        # Can also be supplied per-request
+MODEL           = "gpt-4o-mini"
+HEADERS         = {"User-Agent": "Mozilla/5.0 (compatible; llms-txt-generator/1.0)"}
+jobs            = {}
+
+# ─────────────────────────────────────────────────────
+# OPENAI CALL
+# ─────────────────────────────────────────────────────
+def call_llm(prompt, api_key):
+    import logging
+    client = OpenAI(api_key=api_key)
+    try:
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+            max_tokens=600,
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        logging.error(f"OpenAI API error: {e}")
+        raise
 
 # ─────────────────────────────────────────────────────
 # URL UTILITIES
@@ -81,18 +104,9 @@ def parse_sitemap(source, is_file=False):
     return extract_urls(xml_text), None
 
 # ─────────────────────────────────────────────────────
-# PRODUCT / GROUP DETECTION  (site-agnostic)
+# PRODUCT / GROUP DETECTION
 # ─────────────────────────────────────────────────────
 def find_divergence_depth(urls):
-    """
-    Find the URL path depth where URLs start diverging.
-    Works for any site structure — flat, nested, docs, product, blog.
-
-    Examples:
-      stripe.com/docs/payments, stripe.com/docs/billing  → depth 1 (diverge at segment 1)
-      me.com/products/ad-manager/x, me.com/products/ad-manager/y → depth 2 (same product)
-      docs.site.com/en/articles/x, docs.site.com/en/articles/y  → depth 2
-    """
     parsed_paths = []
     for url in urls:
         parts = [p for p in urlparse(url).path.strip('/').split('/') if p]
@@ -103,9 +117,8 @@ def find_divergence_depth(urls):
 
     min_depth = min(len(p) for p in parsed_paths)
     if min_depth == 0:
-        return 0
+        return 1
 
-    # Find deepest depth where all paths share a common prefix
     common_depth = 0
     for depth in range(min_depth):
         vals = set(p[depth] for p in parsed_paths if len(p) > depth)
@@ -114,34 +127,21 @@ def find_divergence_depth(urls):
         else:
             break
 
-    # The group key depth is one level beyond the common prefix
-    return common_depth + 1
+    return max(common_depth + 1, 1)
 
 def build_product_map(urls):
-    """
-    Universally group URLs into products/sections and name each group
-    by fetching the group's base URL and reading its <title>/<h1>.
-
-    Works for:
-      - Multi-product sites  (manageengine.com/products/ad-manager/)
-      - Docs sites           (docs.stripe.com/payments/)
-      - Single-product sites (everything under one name)
-      - Blogs / news sites   (grouped by category)
-    """
     if not urls:
         return {}
 
-    # Group by domain first
     domain_groups = defaultdict(list)
     for url in urls:
         domain_groups[urlparse(url).netloc].append(url)
 
-    product_map = {}  # url_prefix → product_name
+    product_map = {}
 
     for domain, domain_urls in domain_groups.items():
         depth = find_divergence_depth(domain_urls)
 
-        # Build groups at divergence depth
         groups = defaultdict(list)
         for url in domain_urls:
             parsed = urlparse(url)
@@ -152,13 +152,8 @@ def build_product_map(urls):
         scheme = urlparse(domain_urls[0]).scheme
 
         for key, group_urls in groups.items():
-            # Build base URL for this group
             base_url = f"{scheme}://{domain}/{key}/" if key else f"{scheme}://{domain}/"
-
-            # Fetch product name from base URL
-            name = fetch_group_name(base_url, key, domain)
-
-            # Map every URL's immediate parent directory to this name
+            name     = fetch_group_name(base_url, key, domain)
             for url in group_urls:
                 parsed = urlparse(url)
                 parts  = [p for p in parsed.path.strip('/').split('/') if p]
@@ -168,25 +163,18 @@ def build_product_map(urls):
     return product_map
 
 def fetch_group_name(base_url, path_key, domain):
-    """
-    Fetch the group's base URL and extract a clean name.
-    Falls back gracefully through title → h1 → path slug → domain.
-    """
     try:
         r = requests.get(base_url, headers=HEADERS, timeout=10)
         if r.status_code == 200:
             html = r.text
-            # Try <title>
             m = re.search(r'<title[^>]*>(.*?)</title>', html, re.IGNORECASE | re.DOTALL)
             if m:
                 title = m.group(1).strip()
-                # Strip everything after first | - – (site suffix)
                 title = re.split(r'\s*[|\-\u2013\u2014]\s*', title)[0].strip()
                 title = re.sub(r'&amp;', '&', title)
                 title = re.sub(r'&#\d+;', '', title).strip()
                 if title and 2 < len(title) < 80:
                     return title
-            # Try <h1>
             h = re.search(r'<h1[^>]*>(.*?)</h1>', html, re.IGNORECASE | re.DOTALL)
             if h:
                 h1 = re.sub(r'<[^>]+>', '', h.group(1)).strip()
@@ -194,13 +182,10 @@ def fetch_group_name(base_url, path_key, domain):
                     return h1
     except:
         pass
-
-    # Fall back to path slug or domain
     slug = path_key.split('/')[-1] if path_key else domain
     return slug.replace('-', ' ').replace('_', ' ').title() if slug else domain
 
 def detect_product(url, product_map):
-    """Match a URL to its group name via its immediate parent directory prefix."""
     parsed = urlparse(url)
     parts  = [p for p in parsed.path.strip('/').split('/') if p]
     prefix = f"{parsed.scheme}://{parsed.netloc}/{'/'.join(parts[:-1])}/" if parts else \
@@ -211,11 +196,6 @@ def detect_product(url, product_map):
 # PAGE FETCHING
 # ─────────────────────────────────────────────────────
 def extract_meta(html):
-    """
-    Extract meta title, meta description, H1, and H2s from raw HTML.
-    These are the cleanest, most reliable signals on any page —
-    written by the site itself to describe the page. No sidebar noise.
-    """
     def clean(s):
         s = re.sub(r"<[^>]+>", " ", s)
         s = re.sub(r"&amp;", "&", s)
@@ -224,34 +204,28 @@ def extract_meta(html):
         s = re.sub(r"&[a-z]+;", " ", s)
         return re.sub(r"\s+", " ", s).strip()
 
-    # Meta title — strip site suffix after | or —
     m = re.search(r"<title[^>]*>(.*?)</title>", html, re.IGNORECASE | re.DOTALL)
     meta_title = clean(m.group(1)) if m else ""
     meta_title = re.split(r"\s*[|\u2013\u2014]\s*", meta_title)[0].strip()
 
-    # Meta description (name="description")
     m = re.search(r'<meta[^>]+name=["\']description["\'][^>]+content=["\'](.*?)["\']', html, re.IGNORECASE | re.DOTALL)
     if not m:
         m = re.search(r'<meta[^>]+content=["\'](.*?)["\'"][^>]+name=["\']description["\']', html, re.IGNORECASE | re.DOTALL)
     meta_desc = clean(m.group(1)) if m else ""
 
-    # OG description as fallback
     if not meta_desc:
         m = re.search(r'<meta[^>]+property=["\']og:description["\'][^>]+content=["\'](.*?)["\']', html, re.IGNORECASE | re.DOTALL)
         if not m:
             m = re.search(r'<meta[^>]+content=["\'](.*?)["\'"][^>]+property=["\']og:description["\']', html, re.IGNORECASE | re.DOTALL)
         meta_desc = clean(m.group(1)) if m else ""
 
-    # OG title fallback
     if not meta_title:
         m = re.search(r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\'](.*?)["\']', html, re.IGNORECASE | re.DOTALL)
         meta_title = clean(m.group(1)) if m else ""
 
-    # H1
     m = re.search(r"<h1[^>]*>(.*?)</h1>", html, re.IGNORECASE | re.DOTALL)
     h1 = clean(m.group(1)) if m else ""
 
-    # H2s — up to 6, joined with " | "
     h2s = re.findall(r"<h2[^>]*>(.*?)</h2>", html, re.IGNORECASE | re.DOTALL)
     h2s = [clean(h) for h in h2s if len(clean(h)) > 3][:6]
 
@@ -264,10 +238,6 @@ def extract_meta(html):
 
 
 def extract_main_content(html):
-    """
-    Extract only the main content area, ignoring nav/sidebar/footer.
-    Tries semantic tags first, then role/id/class heuristics.
-    """
     for tag in ["main", "article"]:
         pat = re.compile(r"<" + tag + r"[^>]*>(.*?)</" + tag + r">", re.DOTALL | re.IGNORECASE)
         m = pat.search(html)
@@ -301,15 +271,12 @@ def fetch_page(url):
             return None
         raw_html = r.text
 
-        # Extract meta signals from raw HTML BEFORE any stripping
         meta = extract_meta(raw_html)
 
-        # Strip noise tags
         html = raw_html
         for tag in ["script", "style", "nav", "footer", "header", "aside", "noscript", "iframe", "svg", "form"]:
             html = re.sub(r"<" + tag + r"[^>]*>.*?</" + tag + r">", " ", html, flags=re.DOTALL | re.IGNORECASE)
 
-        # Strip noise sections by class/id
         for noise in ["sidebar", "widget", "banner", "promo", "advertisement",
                       "breadcrumb", "pagination", "related", "social", "share",
                       "cookie", "popup", "modal", "overlay", "newsletter",
@@ -320,15 +287,12 @@ def fetch_page(url):
             )
             html = pat.sub(" ", html)
 
-        # Extract main content body
         main_html = extract_main_content(html)
         body = re.sub(r"<[^>]+>", " ", main_html)
-        body = re.sub(r"\+\d[\d\s\-(). ]{7,20}", " ", body)  # phone numbers
-        body = re.sub(r"[A-Fa-f0-9]{40,}", " ", body)              # SHA hashes
+        body = re.sub(r"\+\d[\d\s\-(). ]{7,20}", " ", body)
+        body = re.sub(r"[A-Fa-f0-9]{40,}", " ", body)
         body = re.sub(r"\s+", " ", body).strip()
 
-        # Build structured context — meta signals first, body last
-        # This order ensures the LLM weights the cleanest signals highest
         parts = []
         if meta["meta_title"]:
             parts.append(f"META TITLE: {meta['meta_title']}")
@@ -347,6 +311,9 @@ def fetch_page(url):
     except:
         return None
 
+# ─────────────────────────────────────────────────────
+# SUMMARIZATION
+# ─────────────────────────────────────────────────────
 SUMMARIZE_PROMPT = """You are a technical writer creating llms.txt entries. These entries are read by AI crawlers to understand what a page contains and who it is for — so precision and distinctiveness matter far more than marketing language.
 
 Read the page content carefully and return ONLY a JSON object.
@@ -408,14 +375,14 @@ Score the description from 1 to 5:
 4 = Good — specific, accurate, audience-aware
 5 = Excellent — leads with the most distinctive fact, audience clear, zero padding
 
-IF score <= 2: rewrite following these rules:
+IF score <= 3: rewrite following these rules:
 - First sentence must lead with the single most distinctive, specific fact about this URL
 - Weave audience in naturally ("IT administrators can...", "End users who need to...")
 - Max 3 sentences, no comma lists of more than 3 items
 - No filler openers, no nav/sidebar content
 - Active voice, present tense
 
-IF score >= 3: return description unchanged.
+IF score >= 4: return description unchanged.
 
 URL: {url}
 Page content (first 1500 chars): {content}
@@ -424,17 +391,14 @@ Current description: {description}
 Return ONLY JSON: {{"score": <1-5>, "description": "<final description>"}}
 No markdown, no explanation."""
 
-def summarize(url, content):
+def summarize(url, content, api_key, progress_q=None):
     snippet = content[:3500].strip()
     if not snippet:
         return None
+    last_error = None
     for attempt in range(3):
         try:
-            response = ollama.chat(
-                model=MODEL,
-                messages=[{"role": "user", "content": SUMMARIZE_PROMPT.format(url=url, content=snippet)}]
-            )
-            raw = response["message"]["content"].strip()
+            raw    = call_llm(SUMMARIZE_PROMPT.format(url=url, content=snippet), api_key)
             if raw.startswith("```"):
                 raw = raw.split("```")[1]
                 if raw.startswith("json"):
@@ -442,26 +406,19 @@ def summarize(url, content):
             result = json.loads(raw.strip())
             if "title" in result and "description" in result:
                 return result
-        except:
+        except Exception as e:
+            last_error = str(e)
             if attempt < 2:
                 time.sleep(0.5)
+            else:
+                if progress_q:
+                    progress_q.put({"type": "stage", "msg": f"API error: {last_error[:120]}", "pct": 0})
     return None
 
-def rescore_and_fix(url, content, description):
-    """
-    Score description 1-5 on specificity.
-    Rewrite only if score <= 2.
-    Returns (score, final_description).
-    """
+def rescore_and_fix(url, content, description, api_key):
     snippet = content[:1500].strip()
     try:
-        response = ollama.chat(
-            model=MODEL,
-            messages=[{"role": "user", "content": RESCORE_PROMPT.format(
-                url=url, content=snippet, description=description
-            )}]
-        )
-        raw = response["message"]["content"].strip()
+        raw = call_llm(RESCORE_PROMPT.format(url=url, content=snippet, description=description), api_key)
         if raw.startswith("```"):
             raw = raw.split("```")[1]
             if raw.startswith("json"):
@@ -474,21 +431,18 @@ def rescore_and_fix(url, content, description):
         return 3, description
 
 # ─────────────────────────────────────────────────────
-# QUALITY CHECKING  — behavioral, site-agnostic
+# QUALITY CHECKING
 # ─────────────────────────────────────────────────────
-
-# Universal filler openers — structural patterns, not content-specific
 FILLER_STARTERS = [
     "this page ", "the page ", "this guide ", "this tool ", "this api ",
     "this document ", "this article ", "this section ",
     "a quick overview", "an overview of", "a guide to", "a guide for",
-    "a list of", "a collection of", "a overview", "detailed information",
-    "users to ", "users the ", "it also ", "the following ",
+    "a list of", "a collection of", "detailed information",
+    "users to ", "users the ", "covers ",
 ]
 
 def strip_filler_opener(desc):
-    """Remove known filler openers and capitalize the remainder."""
-    d = desc.strip()
+    d     = desc.strip()
     lower = d.lower()
     for starter in FILLER_STARTERS:
         if lower.startswith(starter):
@@ -498,57 +452,40 @@ def strip_filler_opener(desc):
     return d
 
 def score_description(desc):
-    """
-    Behavioral quality score — site-agnostic.
-    Returns (score 1-5, list of reasons if bad).
-    """
     issues = []
     d      = desc.strip()
     words  = d.split()
     lower  = d.lower()
 
-    # Score 1: filler opener
     for starter in FILLER_STARTERS:
         if lower.startswith(starter):
             issues.append("filler_opener")
             break
 
-    # Score 1: too short
     if len(d) < 60:
         issues.append("too_short")
 
-    # Score 1: grammatical fragment (starts with infinitive verb pattern)
     if re.match(r'^(to |for |by )', lower):
         issues.append("fragment")
 
-    # Score 2: too long — likely nav/sidebar dump
     if len(words) > 65:
         issues.append("too_long")
 
-    # Score 2: comma list — last sentence has 4+ commas
     sentences = [s.strip() for s in d.split('.') if s.strip()]
-    if sentences and sentences[-1].count(',') >= 4:
-        issues.append("comma_list")
-
-    # Score 2: any single sentence has 4+ commas (list in middle)
     for sent in sentences:
         if sent.count(',') >= 4:
-            issues.append("inline_comma_list")
+            issues.append("comma_list")
             break
 
-    # Score 2: repetitive "and more" ending
     if lower.rstrip().endswith('and more') or lower.rstrip().endswith('and more.'):
         issues.append("and_more_ending")
 
-    # Compute score
     if "filler_opener" in issues or "too_short" in issues or "fragment" in issues:
         score = 1
-    elif "too_long" in issues or "comma_list" in issues or "inline_comma_list" in issues or "and_more_ending" in issues:
+    elif "too_long" in issues or "comma_list" in issues or "and_more_ending" in issues:
         score = 2
-    elif len(issues) > 0:
-        score = 3
     else:
-        score = 4  # Assume 4 unless LLM scoring says otherwise
+        score = 4
 
     return score, issues
 
@@ -571,10 +508,6 @@ Return ONLY JSON: {{"description": "<rewritten description for Page B>"}}
 No markdown, no explanation."""
 
 def description_similarity(a, b):
-    """
-    Word overlap ratio between two descriptions — site-agnostic.
-    Returns 0.0 (no overlap) to 1.0 (identical).
-    """
     words_a = set(re.findall(r'\b\w{4,}\b', a.lower()))
     words_b = set(re.findall(r'\b\w{4,}\b', b.lower()))
     if not words_a or not words_b:
@@ -582,17 +515,10 @@ def description_similarity(a, b):
     overlap = len(words_a & words_b)
     return overlap / min(len(words_a), len(words_b))
 
-def fix_sibling_duplicates(summaries, page_map, progress_q=None):
-    """
-    Phase 3 — Sibling dedup:
-    Find pairs of URLs on the same domain whose descriptions are >70% similar.
-    Re-summarize the second one with explicit instruction to differentiate from the first.
-    Works for any site — no domain or product hardcoding.
-    """
+def fix_sibling_duplicates(summaries, page_map, api_key, progress_q=None):
     if progress_q:
         progress_q.put({"type": "stage", "msg": "QA Phase 3 — Sibling differentiation", "pct": 94})
 
-    # Group summaries by domain
     domain_groups = defaultdict(list)
     for item in summaries:
         domain = urlparse(item["url"]).netloc
@@ -602,32 +528,26 @@ def fix_sibling_duplicates(summaries, page_map, progress_q=None):
     for domain, items in domain_groups.items():
         if len(items) < 2:
             continue
-        # Compare every pair within the same domain
         for i in range(len(items)):
             for j in range(i + 1, len(items)):
                 a = items[i]
                 b = items[j]
                 sim = description_similarity(a["description"], b["description"])
                 if sim >= 0.70:
-                    # Re-summarize b to differentiate from a
                     content_b = page_map.get(b["url"], "")
                     if not content_b:
                         continue
                     try:
-                        response = ollama.chat(
-                            model=MODEL,
-                            messages=[{"role": "user", "content": DIFFERENTIATE_PROMPT.format(
-                                url_a=a["url"], desc_a=a["description"],
-                                url_b=b["url"], content_b=content_b[:2000],
-                                desc_b=b["description"]
-                            )}]
-                        )
-                        raw = response["message"]["content"].strip()
+                        raw = call_llm(DIFFERENTIATE_PROMPT.format(
+                            url_a=a["url"], desc_a=a["description"],
+                            url_b=b["url"], content_b=content_b[:2000],
+                            desc_b=b["description"]
+                        ), api_key)
                         if raw.startswith("```"):
                             raw = raw.split("```")[1]
                             if raw.startswith("json"):
                                 raw = raw[4:]
-                        result = json.loads(raw.strip())
+                        result  = json.loads(raw.strip())
                         new_desc = result.get("description", "").strip()
                         if new_desc and len(new_desc) > 60:
                             b["description"] = new_desc
@@ -641,27 +561,20 @@ def fix_sibling_duplicates(summaries, page_map, progress_q=None):
     return summaries
 
 
-def fix_quality(summaries, page_map, progress_q=None):
-    """
-    Two-phase QA:
-    Phase 1 — Fast structural fixes (strip filler, detect patterns) — no LLM calls
-    Phase 2 — LLM rescore: only re-summarize entries scoring 1-2
-    """
+def fix_quality(summaries, page_map, api_key, progress_q=None):
     total = len(summaries)
 
-    # ── Phase 1: Structural fixes ──
     if progress_q:
         progress_q.put({"type": "stage", "msg": "QA Phase 1 — Structural fixes", "pct": 86})
 
-    structural_fixed = 0
+    stripped = 0
     for item in summaries:
         original = item["description"]
         fixed    = strip_filler_opener(original)
         if fixed != original:
             item["description"] = fixed
-            structural_fixed   += 1
+            stripped += 1
 
-    # Fix duplicate titles
     title_count = Counter(item["title"] for item in summaries)
     dup_fixed   = 0
     for item in summaries:
@@ -674,31 +587,28 @@ def fix_quality(summaries, page_map, progress_q=None):
                 dup_fixed    += 1
 
     if progress_q:
-        progress_q.put({"type": "qa_result", "fixed": structural_fixed, "dups": dup_fixed})
+        progress_q.put({"type": "qa_result", "fixed": stripped, "dups": dup_fixed})
 
-    # ── Phase 2: LLM scoring — only rescore low-quality entries ──
     if progress_q:
         progress_q.put({"type": "stage", "msg": "QA Phase 2 — LLM scoring & rewrite", "pct": 90})
 
     rescore_fixed = 0
     for i, item in enumerate(summaries):
         score, issues = score_description(item["description"])
-
-        if score <= 2:
+        if score <= 3:
             content = page_map.get(item["url"], "")
             if content:
-                new_score, new_desc = rescore_and_fix(item["url"], content, item["description"])
+                new_score, new_desc = rescore_and_fix(item["url"], content, item["description"], api_key)
                 if new_desc != item["description"]:
                     item["description"] = new_desc
                     rescore_fixed      += 1
             if progress_q and i % 5 == 0:
-                progress_q.put({"type": "qa_rescore", "current": i+1, "total": total})
+                progress_q.put({"type": "qa_rescore", "current": i + 1, "total": total})
 
     if progress_q:
         progress_q.put({"type": "qa_result", "fixed": rescore_fixed, "dups": 0})
 
-    # ── Phase 3: Sibling deduplication ──
-    summaries = fix_sibling_duplicates(summaries, page_map, progress_q)
+    summaries = fix_sibling_duplicates(summaries, page_map, api_key, progress_q)
 
     return summaries
 
@@ -706,7 +616,6 @@ def fix_quality(summaries, page_map, progress_q=None):
 # GENERATE llms.txt
 # ─────────────────────────────────────────────────────
 def generate_llms_txt(summaries, product_map):
-    # Deduplicate by URL
     seen_urls = set()
     deduped   = []
     for item in summaries:
@@ -714,7 +623,6 @@ def generate_llms_txt(summaries, product_map):
             seen_urls.add(item["url"])
             deduped.append(item)
 
-    # Flat list — no header block, no category sections
     lines = []
     for item in deduped:
         lines.append(f"- Source: {item['url']}")
@@ -723,7 +631,6 @@ def generate_llms_txt(summaries, product_map):
         lines.append("")
 
     return "\n".join(lines)
-
 
 # ─────────────────────────────────────────────────────
 # HTML UI
@@ -756,23 +663,19 @@ HTML = """<!DOCTYPE html>
       padding: 3px 12px; margin-bottom: 28px;
     }
     label { display: block; font-size: 13px; font-weight: 600; color: #333; margin-bottom: 7px; }
-    .upload-area {
-      border: 2px dashed #d5d5d5; border-radius: 12px; padding: 32px;
-      text-align: center; cursor: pointer; transition: all 0.2s;
-      margin-bottom: 24px; position: relative; background: #fafafa;
-    }
-    .upload-area:hover, .upload-area.drag-over { border-color: #6c47ff; background: #f5f2ff; }
-    .upload-area input[type="file"] {
-      position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; height: 100%;
-    }
-    .upload-icon { font-size: 28px; margin-bottom: 8px; }
-    .upload-text { font-size: 14px; color: #555; font-weight: 500; }
-    .upload-hint { font-size: 12px; color: #aaa; margin-top: 4px; }
-    .file-name { font-size: 13px; color: #6c47ff; font-weight: 600; margin-top: 10px; }
 
-    .tabs {
-      display: flex; gap: 8px; margin-bottom: 16px;
+    .api-key-row {
+      display: flex; gap: 8px; margin-bottom: 20px; align-items: flex-start;
     }
+    .api-key-row input {
+      flex: 1; padding: 11px 14px; border: 1.5px solid #e0e0e0;
+      border-radius: 10px; font-size: 13px; color: #333; outline: none;
+      font-family: monospace; transition: border-color 0.2s;
+    }
+    .api-key-row input:focus { border-color: #6c47ff; }
+    .api-key-note { font-size: 11px; color: #aaa; margin-top: 4px; }
+
+    .tabs { display: flex; gap: 8px; margin-bottom: 16px; }
     .tab {
       flex: 1; padding: 9px 12px; border-radius: 8px; border: 1.5px solid #e0e0e0;
       background: #fafafa; font-size: 12px; font-weight: 600; color: #888;
@@ -780,6 +683,29 @@ HTML = """<!DOCTYPE html>
     }
     .tab:hover { border-color: #6c47ff; color: #6c47ff; }
     .tab.active { background: #6c47ff; border-color: #6c47ff; color: #fff; }
+
+    .upload-area {
+      border: 2px dashed #d5d5d5; border-radius: 12px; padding: 28px;
+      text-align: center; cursor: pointer; transition: all 0.2s;
+      margin-bottom: 20px; position: relative; background: #fafafa;
+    }
+    .upload-area:hover, .upload-area.drag-over { border-color: #6c47ff; background: #f5f2ff; }
+    .upload-area input[type="file"] {
+      position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; height: 100%;
+    }
+    .upload-icon { font-size: 26px; margin-bottom: 6px; }
+    .upload-text { font-size: 14px; color: #555; font-weight: 500; }
+    .upload-hint { font-size: 12px; color: #aaa; margin-top: 4px; }
+    .file-name { font-size: 13px; color: #6c47ff; font-weight: 600; margin-top: 8px; }
+
+    .sitemap-input {
+      width: 100%; padding: 12px 14px; border: 1.5px solid #e0e0e0;
+      border-radius: 10px; font-size: 14px; outline: none; margin-bottom: 20px;
+      transition: border-color 0.2s;
+    }
+    .sitemap-input:focus { border-color: #6c47ff; }
+    .sitemap-hint { font-size: 11px; color: #aaa; margin-top: -16px; margin-bottom: 20px; }
+
     #submitBtn {
       width: 100%; padding: 14px; background: #6c47ff; color: #fff;
       border: none; border-radius: 10px; font-size: 15px; font-weight: 700;
@@ -794,12 +720,12 @@ HTML = """<!DOCTYPE html>
       border-radius: 10px; overflow: hidden; border: 1px solid #e5e7eb;
     }
     .stage-step {
-      flex: 1; padding: 10px 6px; text-align: center;
-      font-size: 11px; font-weight: 600; color: #aaa;
+      flex: 1; padding: 10px 4px; text-align: center;
+      font-size: 10px; font-weight: 600; color: #aaa;
       background: #f9fafb; border-right: 1px solid #e5e7eb; transition: all 0.3s;
     }
     .stage-step:last-child { border-right: none; }
-    .step-icon { font-size: 16px; display: block; margin-bottom: 3px; }
+    .step-icon { font-size: 15px; display: block; margin-bottom: 3px; }
     .stage-step.active { background: #6c47ff; color: #fff; }
     .stage-step.done   { background: #ecfdf5; color: #065f46; }
 
@@ -850,49 +776,91 @@ HTML = """<!DOCTYPE html>
       border-radius: 10px; font-size: 13px; color: #991b1b;
     }
     .error-box.show { display: block; }
+
+    .login-card {
+      background: #fff; border-radius: 20px;
+      box-shadow: 0 4px 32px rgba(0,0,0,0.09);
+      padding: 48px; width: 100%; max-width: 380px;
+      text-align: center;
+    }
+    .login-card h2 { font-size: 20px; color: #1a1a2e; margin-bottom: 8px; }
+    .login-card p  { color: #777; font-size: 13px; margin-bottom: 24px; }
+    .login-input {
+      width: 100%; padding: 12px 14px; border: 1.5px solid #e0e0e0;
+      border-radius: 10px; font-size: 14px; outline: none; margin-bottom: 12px;
+      transition: border-color 0.2s; text-align: center; letter-spacing: 2px;
+    }
+    .login-input:focus { border-color: #6c47ff; }
+    .login-btn {
+      width: 100%; padding: 13px; background: #6c47ff; color: #fff;
+      border: none; border-radius: 10px; font-size: 14px; font-weight: 700;
+      cursor: pointer; transition: background 0.2s;
+    }
+    .login-btn:hover { background: #5735e0; }
+    .login-error { color: #dc2626; font-size: 12px; margin-top: 8px; }
   </style>
 </head>
 <body>
+
+{% if needs_login %}
+<div class="login-card">
+  <div style="font-size:32px;margin-bottom:12px">🔐</div>
+  <h2>llms<span style="color:#6c47ff">.txt</span> Generator</h2>
+  <p>Enter the app password to continue</p>
+  <form method="POST" action="/login">
+    <input class="login-input" type="password" name="password" placeholder="Password" autofocus>
+    {% if login_error %}<div class="login-error">Incorrect password</div>{% endif %}
+    <br><br>
+    <button class="login-btn" type="submit">Unlock</button>
+  </form>
+</div>
+
+{% else %}
 <div class="card">
   <div class="logo">llms<span>.txt</span> Generator</div>
-  <div class="subtitle">Upload a CSV of URLs → get a production-ready llms.txt instantly</div>
-  <div class="badge">⚡ Mistral · Runs Locally · Zero Cost</div>
+  <div class="subtitle">Upload a CSV or sitemap → get a production-ready llms.txt instantly</div>
+  <div class="badge">⚡ GPT-4o-mini · Works on any website · Zero setup</div>
 
   <form id="genForm">
 
-    <!-- Input mode tabs -->
+    {% if not server_has_key %}
+    <label>OpenAI API Key</label>
+    <div class="api-key-row">
+      <div style="flex:1">
+        <input type="password" id="api_key" placeholder="sk-..." autocomplete="off">
+        <div class="api-key-note">Your key is sent directly to OpenAI and never stored</div>
+      </div>
+    </div>
+    {% endif %}
+
+    <label>Input</label>
     <div class="tabs">
-      <button type="button" class="tab active" onclick="switchTab(this, 'csv')">📄 CSV Upload</button>
-      <button type="button" class="tab" onclick="switchTab(this, 'sitemap')">🗺 Sitemap URL</button>
-      <button type="button" class="tab" onclick="switchTab(this, 'sitemapfile')">📁 Sitemap File</button>
+      <button type="button" class="tab active" onclick="switchTab(this,'csv')">📄 CSV Upload</button>
+      <button type="button" class="tab" onclick="switchTab(this,'sitemap')">🗺 Sitemap URL</button>
+      <button type="button" class="tab" onclick="switchTab(this,'sitemapfile')">📁 Sitemap File</button>
     </div>
 
-    <!-- CSV tab -->
     <div class="tab-panel" id="panel-csv">
       <div class="upload-area" id="uploadArea">
-        <input type="file" id="csv_file" name="csv_file" accept=".csv">
+        <input type="file" id="csv_file" accept=".csv">
         <div class="upload-icon">📄</div>
-        <div class="upload-text">Click to upload or drag & drop your CSV</div>
-        <div class="upload-hint">One URL per row — products auto-detected, tracking params stripped</div>
+        <div class="upload-text">Click to upload or drag & drop</div>
+        <div class="upload-hint">One URL per row · products auto-detected</div>
         <div class="file-name" id="fileName"></div>
       </div>
     </div>
 
-    <!-- Sitemap URL tab -->
     <div class="tab-panel" id="panel-sitemap" style="display:none">
-      <input type="url" id="sitemap_url" name="sitemap_url"
-             placeholder="https://yoursite.com/sitemap.xml"
-             style="width:100%;padding:12px 14px;border:1.5px solid #e0e0e0;border-radius:10px;font-size:14px;outline:none;margin-bottom:4px;">
-      <div style="font-size:11px;color:#aaa;margin-bottom:4px">Sitemap index files are supported — child sitemaps will be crawled automatically</div>
+      <input class="sitemap-input" type="url" id="sitemap_url" placeholder="https://yoursite.com/sitemap.xml">
+      <div class="sitemap-hint">Sitemap index files supported — child sitemaps crawled automatically</div>
     </div>
 
-    <!-- Sitemap file upload tab -->
     <div class="tab-panel" id="panel-sitemapfile" style="display:none">
       <div class="upload-area" id="uploadAreaXml">
-        <input type="file" id="sitemap_file" name="sitemap_file" accept=".xml">
+        <input type="file" id="sitemap_file" accept=".xml">
         <div class="upload-icon">🗺</div>
-        <div class="upload-text">Click to upload your sitemap.xml</div>
-        <div class="upload-hint">Local sitemap file — sitemap index files supported</div>
+        <div class="upload-text">Click to upload sitemap.xml</div>
+        <div class="upload-hint">Local file · sitemap index supported</div>
         <div class="file-name" id="fileNameXml"></div>
       </div>
     </div>
@@ -902,7 +870,7 @@ HTML = """<!DOCTYPE html>
 
   <div id="progressPanel">
     <div class="stages">
-      <div class="stage-step" id="step-fetch"><span class="step-icon">🌐</span>Web Fetching</div>
+      <div class="stage-step" id="step-fetch"><span class="step-icon">🌐</span>Fetching</div>
       <div class="stage-step" id="step-summarize"><span class="step-icon">🤖</span>Summarising</div>
       <div class="stage-step" id="step-qa"><span class="step-icon">✅</span>QA & Fix</div>
       <div class="stage-step" id="step-generate"><span class="step-icon">📄</span>Generating</div>
@@ -929,10 +897,20 @@ HTML = """<!DOCTYPE html>
     <div class="error-box" id="errorBox"></div>
   </div>
 </div>
+{% endif %}
 
 <script>
   let resultBlob = null
-  const STAGES = ['fetch', 'summarize', 'qa', 'generate']
+  let activeTab  = 'csv'
+  const STAGES   = ['fetch', 'summarize', 'qa', 'generate']
+
+  function switchTab(btn, tab) {
+    activeTab = tab
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'))
+    btn.classList.add('active')
+    document.querySelectorAll('.tab-panel').forEach(p => p.style.display = 'none')
+    document.getElementById('panel-' + tab).style.display = 'block'
+  }
 
   function setStage(name) {
     let passed = true
@@ -971,51 +949,45 @@ HTML = """<!DOCTYPE html>
     setProgress('Failed', 0)
   }
 
-
-  // Tab switching
-  let activeTab = 'csv'
-  function switchTab(btn, tab) {
-    activeTab = tab
-    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'))
-    btn.classList.add('active')
-    document.querySelectorAll('.tab-panel').forEach(p => p.style.display = 'none')
-    document.getElementById('panel-' + tab).style.display = 'block'
-  }
-
-  // Sitemap file label
-  document.addEventListener('change', function(e) {
-    if (e.target.id === 'sitemap_file') {
-      const name = e.target.files[0]?.name || ''
-      document.getElementById('fileNameXml').textContent = name ? '✓ ' + name : ''
-    }
-  })
-
-  // Focus style for sitemap URL input
-  const sitemapInput = document.getElementById('sitemap_url')
-  if (sitemapInput) {
-    sitemapInput.addEventListener('focus', () => sitemapInput.style.borderColor = '#6c47ff')
-    sitemapInput.addEventListener('blur',  () => sitemapInput.style.borderColor = '#e0e0e0')
-  }
-  document.getElementById('csv_file').addEventListener('change', function() {
+  document.getElementById('csv_file')?.addEventListener('change', function() {
     document.getElementById('fileName').textContent = this.files[0] ? '✓ ' + this.files[0].name : ''
+  })
+  document.getElementById('sitemap_file')?.addEventListener('change', function() {
+    document.getElementById('fileNameXml').textContent = this.files[0] ? '✓ ' + this.files[0].name : ''
   })
 
   const area = document.getElementById('uploadArea')
-  area.addEventListener('dragover', e => { e.preventDefault(); area.classList.add('drag-over') })
-  area.addEventListener('dragleave', () => area.classList.remove('drag-over'))
-  area.addEventListener('drop', e => {
-    e.preventDefault(); area.classList.remove('drag-over')
-    const file = e.dataTransfer.files[0]
-    if (file) {
-      document.getElementById('csv_file').files = e.dataTransfer.files
-      document.getElementById('fileName').textContent = '✓ ' + file.name
-    }
-  })
+  if (area) {
+    area.addEventListener('dragover', e => { e.preventDefault(); area.classList.add('drag-over') })
+    area.addEventListener('dragleave', () => area.classList.remove('drag-over'))
+    area.addEventListener('drop', e => {
+      e.preventDefault(); area.classList.remove('drag-over')
+      const file = e.dataTransfer.files[0]
+      if (file) {
+        document.getElementById('csv_file').files = e.dataTransfer.files
+        document.getElementById('fileName').textContent = '✓ ' + file.name
+      }
+    })
+  }
 
-  document.getElementById('genForm').addEventListener('submit', async function(e) {
+  document.getElementById('genForm')?.addEventListener('submit', async function(e) {
     e.preventDefault()
     const btn   = document.getElementById('submitBtn')
     const panel = document.getElementById('progressPanel')
+
+    const apiKeyInput = document.getElementById('api_key')
+    const apiKey = apiKeyInput ? apiKeyInput.value.trim() : ''
+    if (apiKeyInput && !apiKey) { showError('Please enter your OpenAI API key'); return }
+
+    if (activeTab === 'csv' && !document.getElementById('csv_file').files[0]) {
+      showError('Please upload a CSV file'); return
+    }
+    if (activeTab === 'sitemap' && !document.getElementById('sitemap_url').value.trim()) {
+      showError('Please enter a sitemap URL'); return
+    }
+    if (activeTab === 'sitemapfile' && !document.getElementById('sitemap_file').files[0]) {
+      showError('Please upload a sitemap file'); return
+    }
 
     document.getElementById('logArea').innerHTML = ''
     document.getElementById('resultBox').classList.remove('show')
@@ -1030,12 +1002,19 @@ HTML = """<!DOCTYPE html>
     panel.scrollIntoView({ behavior: 'smooth', block: 'start' })
 
     setStage('fetch')
-    setProgress('Reading CSV...', 2)
+    setProgress('Loading...', 2)
     addLog('Pipeline started', 'stage')
+
+    const formData = new FormData()
+    formData.set('input_mode', activeTab)
+    if (apiKey) formData.set('api_key', apiKey)
+    if (activeTab === 'csv')         formData.set('csv_file', document.getElementById('csv_file').files[0])
+    if (activeTab === 'sitemap')     formData.set('sitemap_url', document.getElementById('sitemap_url').value.trim())
+    if (activeTab === 'sitemapfile') formData.set('sitemap_file', document.getElementById('sitemap_file').files[0])
 
     let jobId
     try {
-      const res = await fetch('/start', { method: 'POST', body: new FormData(this) })
+      const res = await fetch('/start', { method: 'POST', body: formData })
       if (!res.ok) { const err = await res.json(); throw new Error(err.error) }
       jobId = (await res.json()).job_id
     } catch (err) {
@@ -1043,58 +1022,78 @@ HTML = """<!DOCTYPE html>
       btn.disabled = false; btn.textContent = 'Generate llms.txt'; return
     }
 
-    const evtSource = new EventSource('/progress/' + jobId)
-    evtSource.onmessage = function(e) {
-      const d = JSON.parse(e.data)
-      if (d.type === 'ping') return
+    let evtSource = null
+    let sseRetries = 0
+    const MAX_RETRIES = 20
 
-      if (d.type === 'stage') {
-        addLog('▶ ' + d.msg, 'stage')
-        setProgress(d.msg, d.pct || 0)
-        if (d.msg.toLowerCase().includes('fetch'))   setStage('fetch')
-        if (d.msg.toLowerCase().includes('summari')) setStage('summarize')
-        if (d.msg.toLowerCase().includes('quality') || d.msg.toLowerCase().includes('qa')) setStage('qa')
-        if (d.msg.toLowerCase().includes('generat')) setStage('generate')
+    function connectSSE() {
+      if (evtSource) evtSource.close()
+      evtSource = new EventSource('/progress/' + jobId)
+      evtSource.onmessage = function(e) {
+        const d = JSON.parse(e.data)
+        if (d.type === 'ping') return
 
-      } else if (d.type === 'fetch') {
-        setProgress('Web Fetching', Math.round((d.current/d.total)*28)+4, `${d.current} / ${d.total}`, d.url)
-        addLog(`${d.ok?'✓':'✗'} [${d.current}/${d.total}] ${d.url}`, d.ok?'success':'warning')
+        if (d.type === 'stage') {
+          addLog('▶ ' + d.msg, 'stage')
+          setProgress(d.msg, d.pct || 0)
+          if (d.msg.toLowerCase().includes('fetch'))   setStage('fetch')
+          if (d.msg.toLowerCase().includes('summari')) setStage('summarize')
+          if (d.msg.toLowerCase().includes('qa') || d.msg.toLowerCase().includes('quality')) setStage('qa')
+          if (d.msg.toLowerCase().includes('generat')) setStage('generate')
 
-      } else if (d.type === 'summarize') {
-        setProgress('Summarising with Mistral', Math.round((d.current/d.total)*46)+33, `${d.current} / ${d.total}`, d.url)
-        addLog(`${d.ok?'✓':'✗'} [${d.current}/${d.total}] ${d.url}`, d.ok?'success':'warning')
+        } else if (d.type === 'fetch') {
+          setProgress('Fetching pages', Math.round((d.current/d.total)*28)+4, `${d.current} / ${d.total}`, d.url)
+          addLog(`${d.ok?'✓':'✗'} [${d.current}/${d.total}] ${d.url}`, d.ok?'success':'warning')
 
-      } else if (d.type === 'qa_result') {
-        if (d.fixed > 0 || d.dups > 0) addLog(`  ↳ Fixed ${d.fixed} descriptions · ${d.dups} duplicate titles resolved`, 'qa')
-      } else if (d.type === 'qa_rescore') {
-        setProgress('LLM Scoring & Rewriting', 90 + Math.round((d.current/d.total)*7), `${d.current} / ${d.total}`)
+        } else if (d.type === 'summarize') {
+          setProgress('Summarising with GPT-4o-mini', Math.round((d.current/d.total)*46)+33, `${d.current} / ${d.total}`, d.url)
+          addLog(`${d.ok?'✓':'✗'} [${d.current}/${d.total}] ${d.url}`, d.ok?'success':'warning')
 
-      } else if (d.type === 'done') {
+        } else if (d.type === 'qa_result') {
+          if (d.fixed > 0 || d.dups > 0) addLog(`  ↳ Fixed ${d.fixed} descriptions · ${d.dups} duplicate titles resolved`, 'qa')
+
+        } else if (d.type === 'qa_rescore') {
+          setProgress('LLM Scoring & Rewriting', 90 + Math.round((d.current/d.total)*7), `${d.current} / ${d.total}`)
+
+        } else if (d.type === 'done') {
+          sseRetries = MAX_RETRIES
+          evtSource.close()
+          STAGES.forEach(s => {
+            const el = document.getElementById('step-' + s)
+            if (el) { el.classList.remove('active'); el.classList.add('done') }
+          })
+          setProgress('Complete!', 100, `${d.total} entries`)
+          addLog(`✅ Done — ${d.total} entries generated`, 'success')
+          document.getElementById('spinner').style.display = 'none'
+          fetch('/download/' + jobId).then(r => r.blob()).then(blob => {
+            resultBlob = blob
+            document.getElementById('resultSub').textContent = `${d.total} pages summarized · ready to deploy`
+            document.getElementById('resultBox').classList.add('show')
+          })
+          btn.disabled = false; btn.textContent = 'Generate llms.txt'
+
+        } else if (d.type === 'error') {
+          sseRetries = MAX_RETRIES
+          evtSource.close()
+          showError(d.msg)
+          btn.disabled = false; btn.textContent = 'Generate llms.txt'
+        }
+      }
+      evtSource.onerror = function() {
         evtSource.close()
-        STAGES.forEach(s => {
-          const el = document.getElementById('step-' + s)
-          if (el) { el.classList.remove('active'); el.classList.add('done') }
-        })
-        setProgress('Complete!', 100, `${d.total} entries`)
-        addLog(`✅ Done — ${d.total} entries generated`, 'success')
-        document.getElementById('spinner').style.display = 'none'
-        fetch('/download/' + jobId).then(r => r.blob()).then(blob => {
-          resultBlob = blob
-          document.getElementById('resultSub').textContent = `${d.total} pages summarized · ready to deploy`
-          document.getElementById('resultBox').classList.add('show')
-        })
-        btn.disabled = false; btn.textContent = 'Generate llms.txt'
-
-      } else if (d.type === 'error') {
-        evtSource.close()
-        showError(d.msg)
-        btn.disabled = false; btn.textContent = 'Generate llms.txt'
+        if (sseRetries < MAX_RETRIES) {
+          sseRetries++
+          addLog(`↻ Connection dropped — reconnecting (${sseRetries}/${MAX_RETRIES})...`, 'stage')
+          setTimeout(connectSSE, 2000 * sseRetries)
+        } else {
+          showError('Connection lost after multiple retries. The job may still be running — try refreshing and checking /download/' + jobId)
+        }
       }
     }
-    evtSource.onerror = () => evtSource.close()
+    connectSSE()
   })
 
-  document.getElementById('downloadBtn').addEventListener('click', function() {
+  document.getElementById('downloadBtn')?.addEventListener('click', function() {
     if (!resultBlob) return
     const url = URL.createObjectURL(resultBlob)
     const a   = document.createElement('a')
@@ -1106,17 +1105,49 @@ HTML = """<!DOCTYPE html>
 </html>"""
 
 # ─────────────────────────────────────────────────────
+# AUTH
+# ─────────────────────────────────────────────────────
+def is_authenticated():
+    if not APP_PASSWORD:
+        return True
+    return session.get("authenticated") is True
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    error = False
+    if request.method == "POST":
+        if request.form.get("password") == APP_PASSWORD:
+            session["authenticated"] = True
+            return jsonify({"ok": True}) if request.is_json else \
+                   __import__('flask').redirect("/")
+        error = True
+    return render_template_string(HTML, needs_login=True, login_error=error, server_has_key=bool(OPENAI_API_KEY))
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return __import__('flask').redirect("/")
+
+# ─────────────────────────────────────────────────────
 # ROUTES
 # ─────────────────────────────────────────────────────
 @app.route("/")
 def index():
-    return render_template_string(HTML)
+    if not is_authenticated():
+        return render_template_string(HTML, needs_login=True, login_error=False, server_has_key=bool(OPENAI_API_KEY))
+    return render_template_string(HTML, needs_login=False, login_error=False, server_has_key=bool(OPENAI_API_KEY))
 
 @app.route("/start", methods=["POST"])
 def start():
+    if not is_authenticated():
+        return jsonify({"error": "Not authenticated"}), 401
+
+    api_key = request.form.get("api_key", "").strip() or OPENAI_API_KEY
+    if not api_key:
+        return jsonify({"error": "No OpenAI API key provided"}), 400
+
     input_mode = request.form.get("input_mode", "csv")
     urls_raw   = []
-    error_msg  = None
 
     if input_mode == "csv":
         if "csv_file" not in request.files:
@@ -1130,18 +1161,16 @@ def start():
         sitemap_url = request.form.get("sitemap_url", "").strip()
         if not sitemap_url:
             return jsonify({"error": "No sitemap URL provided"}), 400
-        urls_raw, error_msg = parse_sitemap(sitemap_url, is_file=False)
-        if error_msg:
-            return jsonify({"error": f"Sitemap error: {error_msg}"}), 400
+        urls_raw, err = parse_sitemap(sitemap_url, is_file=False)
+        if err:
+            return jsonify({"error": f"Sitemap error: {err}"}), 400
 
     elif input_mode == "sitemapfile":
         if "sitemap_file" not in request.files:
             return jsonify({"error": "No sitemap file uploaded"}), 400
-        file     = request.files["sitemap_file"]
-        raw_data = file.stream.read()
-        urls_raw, error_msg = parse_sitemap(raw_data, is_file=True)
-        if error_msg:
-            return jsonify({"error": f"Sitemap parse error: {error_msg}"}), 400
+        urls_raw, err = parse_sitemap(request.files["sitemap_file"].stream.read(), is_file=True)
+        if err:
+            return jsonify({"error": f"Sitemap parse error: {err}"}), 400
 
     urls_cleaned = [clean_url(u) for u in urls_raw]
     seen         = set()
@@ -1159,17 +1188,15 @@ def start():
             total = len(urls)
             q.put({"type": "stage", "msg": f"{total} unique URLs loaded", "pct": 2})
 
-            # Auto-detect products
             q.put({"type": "stage", "msg": "Detecting products from URLs...", "pct": 3})
-            product_map = build_product_map(urls)
+            product_map    = build_product_map(urls)
             if not product_map:
                 parsed      = urlparse(urls[0])
                 base_url    = f"{parsed.scheme}://{parsed.netloc}/"
                 product_map = {base_url: parsed.netloc}
             products_found = list(dict.fromkeys(product_map.values()))
-            q.put({"type": "stage", "msg": f"Products detected: {', '.join(products_found)}", "pct": 4})
+            q.put({"type": "stage", "msg": f"Products: {', '.join(products_found)}", "pct": 4})
 
-            # Fetch
             q.put({"type": "stage", "msg": "Web Fetching", "pct": 5})
             pages = []
             for i, url in enumerate(urls, 1):
@@ -1178,7 +1205,7 @@ def start():
                 if ok:
                     pages.append({"url": url, "content": content})
                 q.put({"type": "fetch", "current": i, "total": total, "url": url, "ok": ok})
-                time.sleep(0.2)
+                time.sleep(0.1)
 
             if not pages:
                 q.put({"type": "error", "msg": "Could not fetch any pages"})
@@ -1187,12 +1214,11 @@ def start():
             page_map = {p["url"]: p["content"] for p in pages}
             fetched  = len(pages)
 
-            # Summarize
-            q.put({"type": "stage", "msg": "Summarising with Mistral", "pct": 33})
+            q.put({"type": "stage", "msg": "Summarising with GPT-4o-mini", "pct": 33})
             summaries    = []
             failed_pages = []
             for i, page in enumerate(pages, 1):
-                result = summarize(page["url"], page["content"])
+                result = summarize(page["url"], page["content"], api_key, q)
                 ok     = result is not None
                 if ok:
                     summaries.append({
@@ -1208,7 +1234,7 @@ def start():
             if failed_pages:
                 q.put({"type": "stage", "msg": f"Retrying {len(failed_pages)} failed pages", "pct": 80})
                 for page in failed_pages:
-                    result = summarize(page["url"], page["content"])
+                    result = summarize(page["url"], page["content"], api_key, q)
                     if result:
                         summaries.append({
                             "url"        : page["url"],
@@ -1221,11 +1247,9 @@ def start():
                 q.put({"type": "error", "msg": "Could not summarize any pages"})
                 return
 
-            # QA
             q.put({"type": "stage", "msg": "Quality Assurance & Auto-fix", "pct": 85})
-            summaries = fix_quality(summaries, page_map, q)
+            summaries = fix_quality(summaries, page_map, api_key, q)
 
-            # Generate
             q.put({"type": "stage", "msg": "Generating llms.txt", "pct": 97})
             output = generate_llms_txt(summaries, product_map)
             jobs[job_id]["result"] = output.encode("utf-8")
@@ -1249,7 +1273,7 @@ def progress(job_id):
         q   = job["queue"]
         while True:
             try:
-                msg = q.get(timeout=60)
+                msg = q.get(timeout=15)
                 yield f"data: {json.dumps(msg)}\n\n"
                 if msg["type"] in ("done", "error"):
                     break
@@ -1273,6 +1297,8 @@ def download(job_id):
     return send_file(buf, mimetype="text/plain", as_attachment=True, download_name="llms.txt")
 
 if __name__ == "__main__":
-    print("\n✅ llms.txt Generator running!")
-    print("👉 Open this in your browser: http://localhost:5000\n")
-    app.run(host="127.0.0.1", port=5000, debug=False, threaded=True)
+    port = int(os.environ.get("PORT", 5000))
+    print(f"\n✅ llms.txt Generator running on port {port}")
+    print(f"   APP_PASSWORD set: {'yes' if APP_PASSWORD else 'no (open access)'}")
+    print(f"   OPENAI_API_KEY set: {'yes' if OPENAI_API_KEY else 'no (users must provide key)'}\n")
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
